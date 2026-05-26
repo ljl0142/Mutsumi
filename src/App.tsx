@@ -1493,11 +1493,14 @@ function PdfStage({
 
     let isCancelled = false;
     const timeoutId = window.setTimeout(() => {
-      const nextScale = Math.min(2.5, Number((reading.scale + 0.1).toFixed(2)));
-      const previousScale = Math.max(0.5, Number((reading.scale - 0.1).toFixed(2)));
+      const warmScales = [-0.4, -0.3, -0.2, -0.1, 0.1, 0.2]
+        .map((delta) => Math.min(2.5, Math.max(0.5, Number((reading.scale + delta).toFixed(2)))))
+        .filter((scale, index, items) => scale !== reading.scale && items.indexOf(scale) === index);
+
       getVisiblePages(reading).forEach((pageNumber) => {
-        warmPageCanvasCache(pdf, pageNumber, nextScale, reading.rotation, pageCanvasCache, () => isCancelled);
-        warmPageCanvasCache(pdf, pageNumber, previousScale, reading.rotation, pageCanvasCache, () => isCancelled);
+        warmScales.forEach((scale) => {
+          warmPageCanvasCache(pdf, pageNumber, scale, reading.rotation, pageCanvasCache, () => isCancelled);
+        });
       });
     }, 260);
 
