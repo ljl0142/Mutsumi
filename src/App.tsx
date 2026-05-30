@@ -1,4 +1,4 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
+﻿import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, TextareaHTMLAttributes } from "react";
 import {
   BookOpen,
@@ -6,7 +6,9 @@ import {
   ChevronLeft,
   ChevronRight,
   Clipboard,
+  Download,
   FileText,
+  FolderOpen,
   GripHorizontal,
   Highlighter,
   Languages,
@@ -20,16 +22,19 @@ import {
   Settings2,
   Trash2,
   Underline,
-  Upload,
   X,
   ZoomIn,
   ZoomOut
 } from "lucide-react";
 import { pdfjsLib } from "./pdfWorker";
+import { defaultAssistantSettings, getPaperKey, storage } from "./storage";
 import type {
   AnnotationRect,
   AnnotationStyle,
   AnnotationTool,
+  AssistantSettings,
+  CloudProvider,
+  DocumentSaveData,
   PaperAnnotation,
   PaperSheetNote,
   PaperSource,
@@ -54,9 +59,12 @@ const defaultTool: AnnotationTool = {
   mode: "select"
 };
 
-const toolColors = ["#f8d85a", "#9be7c0", "#8ec5ff", "#ffb1c8", "#c8b6ff"];
+const desktopReferenceSize = {
+  width: 1440,
+  height: 900
+};
 
-type LegacySheetNote = PaperSheetNote & { anchor?: { type: "page"; page: number } | { type: "between"; afterPage: number } };
+const toolColors = ["#f8d85a", "#9be7c0", "#8ec5ff", "#ffb1c8", "#c8b6ff"];
 
 type TextSelectionState = {
   text: string;
@@ -80,18 +88,10 @@ type AssistantDraft = {
   result: string;
   provider: "local" | "cloud" | null;
   error: string;
+  notice?: string;
 };
 
 type LeftPanelView = "thumbnails" | "search" | "ai";
-type CloudProvider = "gpt" | "gemini" | "deepseek";
-
-type AssistantSettings = {
-  providerMode: "auto" | "local" | "cloud";
-  cloudProvider: CloudProvider;
-  apiKey: string;
-  sourceLanguage: string;
-  targetLanguage: string;
-};
 
 type TranslatorInstance = {
   translate: (text: string) => Promise<string>;
@@ -116,15 +116,31 @@ type SearchResult = {
 type PageSizeMap = Record<number, { width: number; height: number }>;
 type PageCanvasCache = Map<string, HTMLCanvasElement>;
 type ZoomAnchor = { page: number; xRatio: number; yRatio: number };
-
-const assistantSettingsKey = "pdf-reading:assistant-settings";
-const defaultAssistantSettings: AssistantSettings = {
-  providerMode: "auto",
-  cloudProvider: "gpt",
-  apiKey: "",
-  sourceLanguage: "en",
-  targetLanguage: "zh"
+type DocumentSaveDraft = Omit<DocumentSaveData, "version" | "updatedAt">;
+type AppShellStyle = CSSProperties & {
+  "--app-scale": string;
+  "--app-width": string;
+  "--app-height": string;
 };
+
+function getAppMetrics() {
+  if (!window.pdfReadingStorage) {
+    return {
+      scale: 1,
+      width: window.innerWidth,
+      height: window.innerHeight
+    };
+  }
+
+  const widthRatio = window.innerWidth / desktopReferenceSize.width;
+  const heightRatio = window.innerHeight / desktopReferenceSize.height;
+  const scale = Math.min(1, Math.max(0.68, Math.min(widthRatio, heightRatio)));
+  return {
+    scale,
+    width: window.innerWidth / scale,
+    height: window.innerHeight / scale
+  };
+}
 
 const cloudProviderPresets: Record<CloudProvider, { label: string; baseUrl: string; model: string; envKey: string }> = {
   gpt: {
@@ -147,18 +163,6 @@ const cloudProviderPresets: Record<CloudProvider, { label: string; baseUrl: stri
   }
 };
 
-function getPaperKey(file: File) {
-  return `${file.name}:${file.size}:${file.lastModified}`;
-}
-
-function storageKey(paperKey: string) {
-  return `pdf-reading:annotations:${paperKey}`;
-}
-
-function sheetStorageKey(paperKey: string) {
-  return `pdf-reading:sheet-notes:${paperKey}`;
-}
-
 function createAssistantDraft(mode: AssistantDraft["mode"], text: string, page: number): AssistantDraft {
   return {
     mode,
@@ -170,20 +174,6 @@ function createAssistantDraft(mode: AssistantDraft["mode"], text: string, page: 
     provider: null,
     error: ""
   };
-}
-
-function loadAssistantSettings(): AssistantSettings {
-  try {
-    const saved = window.localStorage.getItem(assistantSettingsKey);
-    if (!saved) return defaultAssistantSettings;
-    return { ...defaultAssistantSettings, ...(JSON.parse(saved) as Partial<AssistantSettings>) };
-  } catch {
-    return defaultAssistantSettings;
-  }
-}
-
-function saveAssistantSettings(settings: AssistantSettings) {
-  window.localStorage.setItem(assistantSettingsKey, JSON.stringify(settings));
 }
 
 function getProviderApiKey(settings: AssistantSettings) {
@@ -198,9 +188,13 @@ function getBrowserTranslator() {
 }
 
 async function runLocalTranslation(text: string, sourceLanguage: string, targetLanguage: string) {
+  if (window.pdfReadingTranslator) {
+    return window.pdfReadingTranslator.translate({ text, sourceLanguage, targetLanguage });
+  }
+
   const translatorApi = getBrowserTranslator();
   if (!translatorApi?.create) {
-    throw new Error("当前浏览器没有可用的本地翻译能力。可以配置云端模型，或在支持内置翻译 API 的浏览器中使用。");
+    throw new Error("当前环境没有可用的本地翻译能力。");
   }
 
   const translator = await translatorApi.create({ sourceLanguage, targetLanguage });
@@ -262,14 +256,6 @@ async function runCloudAssistant(draft: AssistantDraft, settings: AssistantSetti
   const text = getChatCompletionText(await response.json());
   if (!text) throw new Error("云端返回为空。");
   return text;
-}
-
-function normalizeSheetNote(sheet: LegacySheetNote): PaperSheetNote {
-  if (!sheet.anchor) return sheet;
-  return {
-    ...sheet,
-    page: sheet.anchor.type === "page" ? sheet.anchor.page : sheet.anchor.afterPage
-  };
 }
 
 function getVisibleSheetPages(reading: ReadingState) {
@@ -384,6 +370,12 @@ function pageRenderCacheKey(pageNumber: number, scale: number, rotation: number)
   return `${pageNumber}:${scale}:${rotation}`;
 }
 
+function nextFrame() {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, 0);
+  });
+}
+
 function warmPageCanvasCache(
   pdf: PdfDocument,
   pageNumber: number,
@@ -430,6 +422,7 @@ export function App() {
   const [textLinesByPage, setTextLinesByPage] = useState<Record<number, TextLine[]>>({});
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [appMetrics, setAppMetrics] = useState(getAppMetrics);
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
   const [leftPanelView, setLeftPanelView] = useState<LeftPanelView>("thumbnails");
@@ -444,14 +437,23 @@ export function App() {
   const [sheetTrayOpen, setSheetTrayOpen] = useState(false);
   const [textSelection, setTextSelection] = useState<TextSelectionState | null>(null);
   const [assistantDraft, setAssistantDraft] = useState<AssistantDraft | null>(null);
-  const [assistantSettings, setAssistantSettings] = useState<AssistantSettings>(loadAssistantSettings);
+  const [assistantSettings, setAssistantSettings] = useState<AssistantSettings>(() => storage.loadAssistantSettings());
+  const [savedReading, setSavedReading] = useState<DocumentSaveData["reading"] | null>(null);
   const [activeAnnotationId, setActiveAnnotationId] = useState<string | null>(null);
   const [pendingAnnotationId, setPendingAnnotationId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const currentFileRef = useRef<File | null>(null);
   const noteRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
   const viewMenuRef = useRef<HTMLDivElement | null>(null);
   const pageCanvasCacheRef = useRef<PageCanvasCache>(new Map());
   const zoomAnchorRef = useRef<ZoomAnchor | null>(null);
+  const hasShownLocalTranslationNoticeRef = useRef(false);
+  const saveSnapshotRef = useRef<DocumentSaveDraft | null>(null);
+
+  const saveDocumentNow = useCallback(() => {
+    const snapshot = saveSnapshotRef.current;
+    if (snapshot) storage.saveDocument(snapshot);
+  }, []);
 
   const currentAnnotations = useMemo(
     () => annotations.filter((annotation) => annotation.page === activePage),
@@ -470,7 +472,7 @@ export function App() {
   }, [reading.currentPage]);
 
   useEffect(() => {
-    saveAssistantSettings(assistantSettings);
+    storage.saveAssistantSettings(assistantSettings);
   }, [assistantSettings]);
   const currentSheetNotes = useMemo(
     () => sheetNotes.filter((sheet) => isSheetVisible(sheet, getVisibleSheetPages(reading))),
@@ -486,6 +488,15 @@ export function App() {
       })),
     [annotations, visibleAnnotationPages]
   );
+
+  useEffect(() => {
+    if (!window.pdfReadingStorage) return;
+
+    const updateScale = () => setAppMetrics(getAppMetrics());
+    updateScale();
+    window.addEventListener("resize", updateScale);
+    return () => window.removeEventListener("resize", updateScale);
+  }, []);
   const searchResults = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
     if (!query) return [];
@@ -508,22 +519,26 @@ export function App() {
   );
 
   useEffect(() => {
+    window.pdfReadingApp?.ready();
+  }, []);
+
+  useEffect(() => {
     if (!sheetTrayOpen || !activeSheetId) return;
     if (currentSheetNotes.some((sheet) => sheet.id === activeSheetId)) return;
     setActiveSheetId(currentSheetNotes[0]?.id ?? null);
   }, [activeSheetId, currentSheetNotes, sheetTrayOpen]);
 
   const openFile = useCallback((file: File) => {
+    saveDocumentNow();
+
     if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
       setError("请选择 PDF 文件。");
       return;
     }
 
     const nextPaperKey = getPaperKey(file);
-    const saved = window.localStorage.getItem(storageKey(nextPaperKey));
-    const savedSheets = window.localStorage.getItem(sheetStorageKey(nextPaperKey));
-    const savedAnnotations = saved ? (JSON.parse(saved) as PaperAnnotation[]) : [];
-    const savedSheetNotes = savedSheets ? (JSON.parse(savedSheets) as LegacySheetNote[]) : [];
+    const savedDocument = storage.loadDocument(nextPaperKey);
+    currentFileRef.current = file;
 
     setError(null);
     setIsLoading(true);
@@ -536,12 +551,13 @@ export function App() {
     setSearchQuery("");
     setLeftPanelView("thumbnails");
     setAnnotations(
-      savedAnnotations.map((annotation) => ({
+      savedDocument.annotations.map((annotation) => ({
         ...annotation,
         hasNote: annotation.hasNote ?? annotation.note.trim().length > 0
       }))
     );
-    setSheetNotes(savedSheetNotes.map(normalizeSheetNote));
+    setSheetNotes(savedDocument.sheetNotes);
+    setSavedReading(savedDocument.reading ?? null);
     setActiveSheetId(null);
     setSheetTrayOpen(false);
     setActiveAnnotationId(null);
@@ -558,7 +574,7 @@ export function App() {
         objectUrl: URL.createObjectURL(file)
       };
     });
-  }, []);
+  }, [saveDocumentNow]);
 
   useEffect(() => {
     if (!paper) return;
@@ -573,8 +589,20 @@ export function App() {
           return;
         }
         setPdf(document);
-        setReading((state) => ({ ...state, pageCount: document.numPages, currentPage: 1 }));
-        setActivePage(1);
+        setReading((state) => {
+          const restored = savedReading;
+          const currentPage = Math.min(Math.max(restored?.currentPage ?? 1, 1), document.numPages);
+          return {
+            ...state,
+            currentPage,
+            pageCount: document.numPages,
+            scale: restored?.scale ?? state.scale,
+            rotation: restored?.rotation ?? state.rotation,
+            spreadMode: restored?.spreadMode ?? state.spreadMode,
+            flowMode: restored?.flowMode ?? state.flowMode
+          };
+        });
+        setActivePage(Math.min(Math.max(savedReading?.currentPage ?? 1, 1), document.numPages));
       })
       .catch(() => {
         if (!isCancelled) setError("PDF 加载失败，请换一个文件试试。");
@@ -587,70 +615,143 @@ export function App() {
       isCancelled = true;
       loadingTask.destroy();
     };
-  }, [paper]);
+  }, [paper, savedReading]);
 
   useEffect(() => {
     if (!pdf) return;
 
     let isCancelled = false;
+    const preferredPages = getVisiblePages(reading);
+    const pageNumbers = [
+      ...preferredPages,
+      ...Array.from({ length: pdf.numPages }, (_, index) => index + 1).filter((page) => !preferredPages.includes(page))
+    ];
 
-    Promise.all(
-      Array.from({ length: pdf.numPages }, async (_, index) => {
-        const pageNumber = index + 1;
-        const page = await pdf.getPage(pageNumber);
-        const viewport = page.getViewport({ scale: reading.scale, rotation: reading.rotation });
-        return [pageNumber, { width: viewport.width, height: viewport.height }] as const;
-      })
-    ).then((sizes) => {
-      if (!isCancelled) setPageSizes(Object.fromEntries(sizes));
-    }).catch(() => undefined);
+    const loadSizes = async () => {
+      for (let index = 0; index < pageNumbers.length; index += 1) {
+        const pageNumber = pageNumbers[index];
+        try {
+          const page = await pdf.getPage(pageNumber);
+          if (isCancelled) return;
+          const viewport = page.getViewport({ scale: 1, rotation: reading.rotation });
+          setPageSizes((sizes) => ({
+            ...sizes,
+            [pageNumber]: { width: viewport.width * reading.scale, height: viewport.height * reading.scale }
+          }));
+        } catch {
+          // Individual page size failures should not block the rest of the document.
+        }
+
+        if (index > 0 && index % 4 === 0) await nextFrame();
+      }
+    };
+
+    loadSizes();
 
     return () => {
       isCancelled = true;
     };
-  }, [pdf, reading.rotation, reading.scale]);
+  }, [pdf, reading.rotation, reading.spreadMode]);
 
   useEffect(() => {
-    if (!pdf) return;
+    if (!pdf || leftPanelView !== "search") return;
 
     let isCancelled = false;
     setIsSearchIndexing(true);
     setSearchPages([]);
 
-    Promise.all(
-      Array.from({ length: pdf.numPages }, async (_, index) => {
+    const buildSearchIndex = async () => {
+      const pages: SearchPage[] = [];
+
+      for (let index = 0; index < pdf.numPages; index += 1) {
         const pageNumber = index + 1;
-        const page = await pdf.getPage(pageNumber);
-        const textContent = await page.getTextContent();
-        const text = textContent.items
-          .map((item) => ("str" in item ? item.str : ""))
-          .join(" ")
-          .replace(/\s+/g, " ")
-          .trim();
-        return { page: pageNumber, text };
-      })
-    )
-      .then((pages) => {
-        if (!isCancelled) setSearchPages(pages);
-      })
-      .finally(() => {
-        if (!isCancelled) setIsSearchIndexing(false);
-      });
+        try {
+          const page = await pdf.getPage(pageNumber);
+          const textContent = await page.getTextContent();
+          const text = textContent.items
+            .map((item) => ("str" in item ? item.str : ""))
+            .join(" ")
+            .replace(/\s+/g, " ")
+            .trim();
+
+          pages.push({ page: pageNumber, text });
+          if (!isCancelled && (pageNumber === 1 || pageNumber % 8 === 0)) {
+            setSearchPages([...pages]);
+          }
+        } catch {
+          // Keep indexing even if a single page has no readable text.
+        }
+
+        if (pageNumber % 4 === 0) await nextFrame();
+        if (isCancelled) return;
+      }
+
+      if (!isCancelled) {
+        setSearchPages(pages);
+        setIsSearchIndexing(false);
+      }
+    };
+
+    buildSearchIndex();
 
     return () => {
       isCancelled = true;
     };
-  }, [pdf]);
+  }, [leftPanelView, pdf]);
 
   useEffect(() => {
-    if (!paperKey) return;
-    window.localStorage.setItem(storageKey(paperKey), JSON.stringify(annotations));
-  }, [annotations, paperKey]);
+    if (!paperKey || !pdf) {
+      saveSnapshotRef.current = null;
+      return;
+    }
+
+    saveSnapshotRef.current = {
+      paperKey,
+      annotations,
+      sheetNotes,
+      reading: {
+        currentPage: reading.currentPage,
+        scale: reading.scale,
+        rotation: reading.rotation,
+        spreadMode: reading.spreadMode,
+        flowMode: reading.flowMode
+      }
+    };
+
+    const saveTimer = window.setTimeout(() => {
+      saveDocumentNow();
+    }, 300);
+
+    return () => window.clearTimeout(saveTimer);
+  }, [
+    annotations,
+    paperKey,
+    pdf,
+    reading.currentPage,
+    reading.flowMode,
+    reading.rotation,
+    reading.scale,
+    reading.spreadMode,
+    saveDocumentNow,
+    sheetNotes
+  ]);
 
   useEffect(() => {
-    if (!paperKey) return;
-    window.localStorage.setItem(sheetStorageKey(paperKey), JSON.stringify(sheetNotes));
-  }, [paperKey, sheetNotes]);
+    const saveBeforeExit = () => saveDocumentNow();
+    const saveWhenHidden = () => {
+      if (document.visibilityState === "hidden") saveDocumentNow();
+    };
+
+    window.addEventListener("beforeunload", saveBeforeExit);
+    window.addEventListener("pagehide", saveBeforeExit);
+    document.addEventListener("visibilitychange", saveWhenHidden);
+
+    return () => {
+      window.removeEventListener("beforeunload", saveBeforeExit);
+      window.removeEventListener("pagehide", saveBeforeExit);
+      document.removeEventListener("visibilitychange", saveWhenHidden);
+    };
+  }, [saveDocumentNow]);
 
   useEffect(() => {
     return () => {
@@ -702,12 +803,24 @@ export function App() {
   };
 
   const changeScale = (delta: number) => {
-    zoomAnchorRef.current ??= { page: activePage, xRatio: 0.5, yRatio: 0.08 };
-    setReading((state) => ({
-      ...state,
-      scale: Math.min(2.5, Math.max(0.5, Number((state.scale + delta).toFixed(2)))),
-      fitMode: "free"
-    }));
+    zoomAnchorRef.current = null;
+    setReading((state) => {
+      const nextScale = Math.min(2.5, Math.max(0.5, Number((state.scale + delta).toFixed(2))));
+      const ratio = nextScale / state.scale;
+      setPageSizes((sizes) =>
+        Object.fromEntries(
+          Object.entries(sizes).map(([page, size]) => [
+            page,
+            { width: size.width * ratio, height: size.height * ratio }
+          ])
+        )
+      );
+      return {
+        ...state,
+        scale: nextScale,
+        fitMode: "free"
+      };
+    });
   };
 
   const commitPageDraft = () => {
@@ -832,7 +945,17 @@ export function App() {
 
     const provider: AssistantDraft["provider"] =
       assistantSettings.providerMode === "local" || !canUseCloud ? "local" : "cloud";
-    setAssistantDraft({ ...assistantDraft, status: "loading", error: "", result: "", provider });
+    const shouldShowLocalTranslationNotice =
+      provider === "local" && assistantDraft.mode === "translate" && !hasShownLocalTranslationNoticeRef.current;
+    if (shouldShowLocalTranslationNotice) hasShownLocalTranslationNoticeRef.current = true;
+    setAssistantDraft({
+      ...assistantDraft,
+      status: "loading",
+      error: "",
+      result: "",
+      provider,
+      notice: shouldShowLocalTranslationNotice ? "首次加载本地模型会稍慢。" : ""
+    });
 
     try {
       const result =
@@ -847,19 +970,26 @@ export function App() {
             : await Promise.reject(new Error("提问需要配置云端模型，本地模式暂不支持问答。"));
 
       setAssistantDraft((current) =>
-        current ? { ...current, status: "done", result, error: "", provider } : current
+        current ? { ...current, status: "done", result, error: "", provider, notice: "" } : current
       );
     } catch (errorValue) {
       const message = errorValue instanceof Error ? errorValue.message : "处理失败。";
       if (assistantSettings.providerMode === "auto" && provider === "cloud" && assistantDraft.mode === "translate") {
         try {
+          const shouldShowFallbackNotice = !hasShownLocalTranslationNoticeRef.current;
+          if (shouldShowFallbackNotice) hasShownLocalTranslationNoticeRef.current = true;
+          if (shouldShowFallbackNotice) {
+            setAssistantDraft((current) =>
+              current ? { ...current, provider: "local", notice: "首次加载本地模型会稍慢。" } : current
+            );
+          }
           const result = await runLocalTranslation(
             assistantDraft.text,
             assistantSettings.sourceLanguage,
             assistantSettings.targetLanguage
           );
           setAssistantDraft((current) =>
-            current ? { ...current, status: "done", result, error: "", provider: "local" } : current
+            current ? { ...current, status: "done", result, error: "", provider: "local", notice: "" } : current
           );
           return;
         } catch {
@@ -868,7 +998,7 @@ export function App() {
       }
 
       setAssistantDraft((current) =>
-        current ? { ...current, status: "error", result: "", error: message, provider } : current
+        current ? { ...current, status: "error", result: "", error: message, provider, notice: "" } : current
       );
     }
   }, [assistantDraft, assistantSettings]);
@@ -931,9 +1061,34 @@ export function App() {
     });
   };
 
+  const exportPdf = async () => {
+    const file = currentFileRef.current;
+    if (!file) return;
+
+    const data = await file.arrayBuffer();
+    if (window.pdfReadingFile) {
+      await window.pdfReadingFile.savePdf({ defaultName: file.name, data });
+      return;
+    }
+
+    const url = URL.createObjectURL(new Blob([data], { type: "application/pdf" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = file.name;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <main
       className="app-shell"
+      style={
+        {
+          "--app-scale": appMetrics.scale.toFixed(3),
+          "--app-width": `${appMetrics.width}px`,
+          "--app-height": `${appMetrics.height}px`
+        } as AppShellStyle
+      }
       onDragOver={(event) => event.preventDefault()}
       onDrop={(event) => {
         event.preventDefault();
@@ -948,11 +1103,14 @@ export function App() {
             <strong>PDF Reading</strong>
             <span>{paper ? paper.name : "本地论文阅读工作台"}</span>
           </div>
+          <button className="brand-open-button" title="Open PDF" onClick={() => fileInputRef.current?.click()}>
+            <FolderOpen size={17} />
+          </button>
         </div>
 
         <div className="toolbar">
-          <button title="打开 PDF" onClick={() => fileInputRef.current?.click()}>
-            <Upload size={18} />
+          <button title="导出 PDF" disabled={!paper} onClick={exportPdf}>
+            <Download size={18} />
           </button>
           <input
             ref={fileInputRef}
@@ -1043,7 +1201,7 @@ export function App() {
           </div>
         </div>
 
-        <div className="annotation-toolbar" aria-label="标注笔工具栏">
+        <div className="annotation-toolbar" aria-label="标注工具栏">
           {toolColors.map((color) => (
             <button
               className={`swatch ${tool.color === color ? "active" : ""}`}
@@ -1067,7 +1225,7 @@ export function App() {
 
       <section className="workspace">
         <aside className={`left-panel ${leftOpen ? "open" : "closed"}`}>
-          <button className="panel-toggle" title="切换目录" onClick={() => setLeftOpen((value) => !value)}>
+          <button className="panel-toggle" title="切换功能栏" onClick={() => setLeftOpen((value) => !value)}>
             <PanelLeftClose size={18} />
           </button>
           {leftOpen && (
@@ -1221,7 +1379,7 @@ export function App() {
         </section>
 
         <aside className={`right-panel ${rightOpen ? "open" : "closed"}`}>
-          <button className="panel-toggle" title="切换注释" onClick={() => setRightOpen((value) => !value)}>
+          <button className="panel-toggle" title="切换注释栏" onClick={() => setRightOpen((value) => !value)}>
             <PanelRightClose size={18} />
           </button>
           {rightOpen && (
@@ -1235,8 +1393,7 @@ export function App() {
                         key={page}
                         onClick={() => setActivePage(page)}
                       >
-                        第 {page} 页
-                        <span>{count}</span>
+                        第 {page} 页 <span>{count}</span>
                       </button>
                     ))}
                   </div>
@@ -1408,58 +1565,6 @@ function PdfStage({
   const layoutReady = Object.keys(pageSizes).length >= reading.pageCount;
 
   useEffect(() => {
-    const stage = stageRef.current;
-    if (!stage) return;
-    const updateAnchor = () => {
-      const stageRect = stage.getBoundingClientRect();
-      const anchorX = stageRect.left + Math.min(stage.clientWidth * 0.5, stage.clientWidth - 24);
-      const anchorY = stageRect.top + (reading.flowMode === "scroll" ? 32 : Math.min(stage.clientHeight * 0.18, 96));
-      const pageElements = Array.from(stage.querySelectorAll<HTMLElement>("[data-page-number]"));
-      const pageElement =
-        pageElements.find((element) => {
-          const rect = element.getBoundingClientRect();
-          return anchorX >= rect.left && anchorX <= rect.right && anchorY >= rect.top && anchorY <= rect.bottom;
-        }) ??
-        pageElements.reduce<HTMLElement | null>((best, element) => {
-          if (!best) return element;
-          const rect = element.getBoundingClientRect();
-          const bestRect = best.getBoundingClientRect();
-          const distance = Math.hypot(rect.left + rect.width / 2 - anchorX, rect.top + rect.height / 2 - anchorY);
-          const bestDistance = Math.hypot(bestRect.left + bestRect.width / 2 - anchorX, bestRect.top + bestRect.height / 2 - anchorY);
-          return distance < bestDistance ? element : best;
-        }, null);
-
-      if (!pageElement || pageElement.offsetHeight === 0 || pageElement.offsetWidth === 0) return;
-      const pageRect = pageElement.getBoundingClientRect();
-      onZoomAnchor({
-        page: Number(pageElement.dataset.pageNumber),
-        xRatio: Math.min(Math.max((anchorX - pageRect.left) / pageRect.width, 0), 1),
-        yRatio: Math.min(Math.max((anchorY - pageRect.top) / pageRect.height, 0), 1)
-      });
-    };
-
-    updateAnchor();
-    stage.addEventListener("scroll", updateAnchor, { passive: true });
-    return () => stage.removeEventListener("scroll", updateAnchor);
-  }, [onZoomAnchor, reading.currentPage, reading.flowMode, layoutReady]);
-
-  useLayoutEffect(() => {
-    if (!pdf || !layoutReady || !zoomAnchorRef.current) return;
-    const stage = stageRef.current;
-    if (!stage) return;
-    const { page, xRatio, yRatio } = zoomAnchorRef.current;
-    const pageElement = stage.querySelector<HTMLElement>(`[data-page-number="${page}"]`);
-    if (!pageElement) return;
-
-    const anchorX = Math.min(stage.clientWidth * 0.5, stage.clientWidth - 24);
-    const anchorY = reading.flowMode === "scroll" ? 32 : Math.min(stage.clientHeight * 0.18, 96);
-    stage.scrollLeft = Math.max(0, pageElement.offsetLeft + pageElement.offsetWidth * xRatio - anchorX);
-    stage.scrollTop = Math.max(0, pageElement.offsetTop + pageElement.offsetHeight * yRatio - anchorY);
-
-    zoomAnchorRef.current = null;
-  }, [layoutReady, pdf, reading.flowMode, reading.rotation, reading.scale, zoomAnchorRef]);
-
-  useEffect(() => {
     if (!pdf || reading.flowMode !== "paged") return;
 
     let isCancelled = false;
@@ -1558,7 +1663,7 @@ function PdfStage({
         <div className="drop-target">
           <FileText size={42} />
           <h1>打开一篇 PDF 开始阅读</h1>
-          <p>支持拖拽到窗口，也可以从本地选择文件。文件只在浏览器本地处理。</p>
+          <p>支持拖拽到窗口，也可以从本地选择文件。文件只在本地处理。</p>
           <button className="primary-action" onClick={onOpenFile}>
             选择 PDF
           </button>
@@ -2225,11 +2330,12 @@ function AiPanel({
       <button className="ai-run-button" disabled={runDisabled} onClick={onRun}>
         {assistantDraft.status === "loading" ? "处理中..." : assistantDraft.mode === "translate" ? "翻译" : "提问"}
       </button>
-      <div className={`ai-result-placeholder ${assistantDraft.status}`}>
+      <div className={"ai-result-placeholder " + assistantDraft.status}>
         <strong>
           {assistantDraft.mode === "translate" ? "翻译结果" : "回答"}
-          {assistantDraft.provider ? ` · ${assistantDraft.provider === "cloud" ? "云端" : "本地"}` : ""}
+          {assistantDraft.provider ? " / " + (assistantDraft.provider === "cloud" ? "云端" : "本地") : ""}
         </strong>
+        {assistantDraft.notice ? <p className="ai-notice">{assistantDraft.notice}</p> : null}
         {assistantDraft.status === "error" ? (
           <p>{assistantDraft.error}</p>
         ) : assistantDraft.result ? (
@@ -2237,8 +2343,8 @@ function AiPanel({
         ) : (
           <p>
             {assistantDraft.mode === "translate"
-              ? `自动模式会优先使用 ${selectedProvider.label}；没有配置密钥时尝试本地翻译。`
-              : `提问需要已配置的 ${selectedProvider.label} 云端模型。`}
+              ? "自动模式会优先使用 " + selectedProvider.label + "；没有配置密钥时尝试本地翻译。"
+              : "提问需要已配置的 " + selectedProvider.label + " 云端模型。"}
           </p>
         )}
       </div>

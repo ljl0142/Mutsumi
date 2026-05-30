@@ -40,9 +40,15 @@ button:disabled {
 }
 
 .app-shell {
+  --app-scale: 1;
+  --app-width: 100vw;
+  --app-height: 100vh;
   display: grid;
   grid-template-rows: 58px minmax(0, 1fr);
-  height: 100vh;
+  width: var(--app-width);
+  height: var(--app-height);
+  transform: scale(var(--app-scale));
+  transform-origin: 0 0;
 }
 
 .top-bar {
@@ -60,6 +66,15 @@ button:disabled {
   align-items: center;
   min-width: 0;
   gap: 10px;
+}
+
+.brand-open-button {
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 7px;
 }
 
 .brand-block div {
@@ -644,7 +659,8 @@ button:disabled {
 }
 
 .annotation-mark.highlight {
-  background: color-mix(in srgb, var(--mark-color) 48%, transparent);
+  background: color-mix(in srgb, var(--mark-color) 44%, transparent);
+  mix-blend-mode: multiply;
 }
 
 .annotation-mark.underline {
@@ -1234,6 +1250,12 @@ textarea {
   color: #627068;
   font-size: 12px;
   line-height: 1.5;
+}
+
+.ai-result-placeholder .ai-notice {
+  margin-bottom: 8px;
+  color: #6f775b;
+  font-size: 12px;
 }
 
 .ai-result-placeholder.error {

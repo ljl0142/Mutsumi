@@ -58,3 +58,22 @@ export type PaperSheetNote = {
   createdAt: string;
   updatedAt: string;
 };
+
+export type CloudProvider = "gpt" | "gemini" | "deepseek";
+
+export type AssistantSettings = {
+  providerMode: "auto" | "local" | "cloud";
+  cloudProvider: CloudProvider;
+  apiKey: string;
+  sourceLanguage: string;
+  targetLanguage: string;
+};
+
+export type DocumentSaveData = {
+  version: number;
+  paperKey: string;
+  annotations: PaperAnnotation[];
+  sheetNotes: PaperSheetNote[];
+  reading?: Pick<ReadingState, "currentPage" | "scale" | "rotation" | "spreadMode" | "flowMode">;
+  updatedAt: string;
+};
