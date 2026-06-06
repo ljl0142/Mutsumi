@@ -1,6 +1,8 @@
 {
-  "name": "pdf-reading",
+  "name": "mutsumi",
   "version": "0.1.0",
+  "description": "Mutsumi, a local-first PDF reading and annotation app.",
+  "author": "AliceWonderland",
   "private": true,
   "type": "module",
   "main": "electron/main.cjs",
@@ -10,20 +12,61 @@
     "electron:dev": "node electron/dev.cjs",
     "electron": "electron electron/main.cjs",
     "desktop": "npm run build && electron electron/main.cjs",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 127.0.0.1",
+    "pack": "npm run build && set ELECTRON_BUILDER_CACHE=.builder-cache&& electron-builder --dir",
+    "dist": "npm run build && set ELECTRON_BUILDER_CACHE=.builder-cache&& electron-builder"
   },
-  "dependencies": {
+  "build": {
+    "appId": "com.mutsumi.app",
+    "productName": "Mutsumi",
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "local-runtime/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "local-runtime/**/*"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "dependencies": {},
+  "devDependencies": {
     "@vitejs/plugin-react": "^5.0.0",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.2.3",
+    "electron": "^33.2.1",
+    "electron-builder": "^26.8.1",
     "lucide-react": "^0.468.0",
     "pdfjs-dist": "^4.10.38",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.0"
-  },
-  "devDependencies": {
-    "electron": "^33.2.1",
-    "@types/react": "^19.2.15",
-    "@types/react-dom": "^19.2.3"
   }
 }

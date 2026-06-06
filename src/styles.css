@@ -588,7 +588,7 @@ button:disabled {
 .text-layer.selectable {
   z-index: 3;
   pointer-events: auto;
-  user-select: text;
+  user-select: none;
 }
 
 .text-layer :is(span, br) {
@@ -620,6 +620,20 @@ button:disabled {
 
 .text-layer span::selection {
   background: rgba(78, 126, 166, 0.32);
+}
+
+.custom-text-selection-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.custom-text-selection {
+  position: absolute;
+  border-radius: 2px;
+  background: rgba(78, 126, 166, 0.28);
+  mix-blend-mode: multiply;
 }
 
 .text-layer br::selection {

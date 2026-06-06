@@ -3,10 +3,79 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PDF Reading</title>
+    <title>Mutsumi</title>
+    <style>
+      html,
+      body,
+      #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+
+      body {
+        background: #eef1ec;
+      }
+
+      .boot-shell {
+        box-sizing: border-box;
+        width: 100%;
+        height: 100%;
+        padding: 14px;
+        display: grid;
+        grid-template-rows: 48px 1fr;
+        gap: 12px;
+        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+        color: #38423d;
+      }
+
+      .boot-toolbar,
+      .boot-panel,
+      .boot-page {
+        background: rgba(255, 255, 255, 0.74);
+        border: 1px solid rgba(92, 105, 98, 0.18);
+      }
+
+      .boot-toolbar {
+        border-radius: 8px;
+      }
+
+      .boot-body {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 176px 1fr 232px;
+        gap: 12px;
+      }
+
+      .boot-panel {
+        border-radius: 8px;
+      }
+
+      .boot-reader {
+        min-width: 0;
+        display: grid;
+        place-items: center;
+      }
+
+      .boot-page {
+        width: min(58vw, 690px);
+        aspect-ratio: 0.775;
+        border-radius: 4px;
+        box-shadow: 0 18px 44px rgba(49, 57, 54, 0.12);
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="boot-shell">
+        <div class="boot-toolbar"></div>
+        <div class="boot-body">
+          <div class="boot-panel"></div>
+          <div class="boot-reader"><div class="boot-page"></div></div>
+          <div class="boot-panel"></div>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

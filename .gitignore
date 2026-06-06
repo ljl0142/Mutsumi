@@ -1,5 +1,6 @@
 node_modules/
 dist/
+release/
 .venv-argos/
 
 .env
@@ -17,6 +18,13 @@ pnpm-debug.log*
 Thumbs.db
 
 .vite/
+.builder-cache/
 .argos-config/
 .argos-cache/
+.argos-data/
+pdf_data/
+pdf-reading-data/
 coverage/
+
+*.log
+*.tsbuildinfo

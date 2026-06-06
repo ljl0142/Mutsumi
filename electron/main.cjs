@@ -1,4 +1,4 @@
-const fs = require("node:fs");
+﻿const fs = require("node:fs");
 const path = require("node:path");
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
 const { translateLocally } = require("./localTranslator.cjs");
@@ -7,7 +7,7 @@ const isDev = process.env.NODE_ENV === "development" || process.env.ELECTRON_STA
 const devUrl = process.env.ELECTRON_START_URL || "http://127.0.0.1:5173";
 const customUserDataDir = process.env.PDF_READING_USER_DATA_DIR;
 
-app.setName("PDF Reading");
+app.setName("Mutsumi");
 Menu.setApplicationMenu(null);
 if (customUserDataDir) {
   app.setPath("userData", customUserDataDir);
@@ -15,6 +15,18 @@ if (customUserDataDir) {
 
 function storageDir() {
   const dir = path.join(app.getPath("userData"), "storage");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function modelsDir() {
+  const dir = path.join(app.getPath("userData"), "models");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function cacheDir() {
+  const dir = path.join(app.getPath("userData"), "cache");
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -44,14 +56,143 @@ function settingsPath() {
   return path.join(storageDir(), "assistant-settings.json");
 }
 
+function iconPath() {
+  return path.join(__dirname, "..", "build", "icon.ico");
+}
+
+function iconDataUrl() {
+  try {
+    const icon = fs.readFileSync(path.join(__dirname, "..", "build", "icon.png"));
+    return `data:image/png;base64,${icon.toString("base64")}`;
+  } catch {
+    return "";
+  }
+}
+
+function createSplashWindow() {
+  const splashIcon = iconDataUrl();
+  const splash = new BrowserWindow({
+    width: 340,
+    height: 150,
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    frame: false,
+    show: true,
+    alwaysOnTop: true,
+    title: "Mutsumi",
+    icon: iconPath(),
+    backgroundColor: "#f8faf4",
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  });
+
+  splash.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`
+    <!doctype html>
+    <html lang="zh-CN">
+      <head>
+        <meta charset="UTF-8" />
+        <style>
+          * { box-sizing: border-box; }
+          html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+            background: #f8faf4;
+            color: #26312d;
+            font-family: Inter, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+          }
+          body {
+            display: grid;
+            place-items: center;
+            border: 1px solid rgba(89, 103, 96, 0.22);
+          }
+          .wrap {
+            width: 100%;
+            padding: 24px 28px;
+            display: grid;
+            grid-template-columns: 42px 1fr;
+            align-items: center;
+            gap: 16px;
+          }
+          .mark {
+            width: 42px;
+            height: 42px;
+            display: grid;
+            place-items: center;
+            border-radius: 10px;
+            background: #e6efe7;
+            overflow: hidden;
+          }
+          .mark img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+          }
+          strong {
+            display: block;
+            font-size: 15px;
+            margin-bottom: 6px;
+          }
+          span {
+            display: block;
+            font-size: 12px;
+            color: #6b7670;
+          }
+          .bar {
+            grid-column: 1 / -1;
+            height: 3px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: #dbe3dc;
+          }
+          .bar::before {
+            content: "";
+            display: block;
+            width: 38%;
+            height: 100%;
+            border-radius: inherit;
+            background: #5f9d78;
+            animation: load 1.1s ease-in-out infinite;
+          }
+          @keyframes load {
+            0% { transform: translateX(-110%); }
+            100% { transform: translateX(280%); }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="wrap">
+          <div class="mark">${splashIcon ? `<img src="${splashIcon}" alt="" />` : ""}</div>
+          <div>
+            <strong>Mutsumi</strong>
+            <span>正在启动...</span>
+          </div>
+          <div class="bar"></div>
+        </div>
+      </body>
+    </html>
+  `)}`);
+
+  return splash;
+}
+
 function createWindow() {
+  const splash = createSplashWindow();
   const win = new BrowserWindow({
     width: 1280,
     height: 840,
     minWidth: 980,
     minHeight: 680,
     show: false,
-    title: "PDF Reading",
+    title: "Mutsumi",
+    icon: iconPath(),
     backgroundColor: "#eef1ec",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -69,10 +210,16 @@ function createWindow() {
   const showWindow = () => {
     if (win.isDestroyed() || win.isVisible()) return;
     win.show();
+    if (!splash.isDestroyed()) splash.close();
   };
 
   const fallbackTimer = setTimeout(showWindow, 5000);
-  win.on("closed", () => clearTimeout(fallbackTimer));
+  win.on("closed", () => {
+    clearTimeout(fallbackTimer);
+    if (!splash.isDestroyed()) splash.close();
+  });
+  win.once("ready-to-show", showWindow);
+  win.webContents.once("dom-ready", showWindow);
 
   if (isDev) {
     win.loadURL(devUrl);
@@ -119,6 +266,9 @@ ipcMain.handle("file:save-pdf", async (_event, request) => {
 });
 
 app.whenReady().then(() => {
+  storageDir();
+  modelsDir();
+  cacheDir();
   createWindow();
 
   app.on("activate", () => {

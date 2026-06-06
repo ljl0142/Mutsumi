@@ -70,13 +70,34 @@ type TextSelectionState = {
   text: string;
   page: number;
   position: { left: number; top: number };
+  rects?: AnnotationRect[];
 };
 
 type TextLine = {
   text: string;
   top: number;
+  bottom: number;
   left: number;
   right: number;
+  start: number;
+  end: number;
+  line: number;
+};
+
+type TextCharBox = {
+  char: string;
+  index: number;
+  line: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type TextPageModel = {
+  text: string;
+  chars: TextCharBox[];
+  lines: TextLine[];
 };
 
 type AssistantDraft = {
@@ -278,11 +299,11 @@ function getVisibleAnnotationPages(reading: ReadingState) {
   return [reading.currentPage];
 }
 
-function buildTextLines(
+function buildTextPageModel(
   textContent: { items: Array<unknown> },
   viewport: pdfjsLib.PageViewport
-): TextLine[] {
-  const lines = new Map<number, Array<{ text: string; left: number; right: number }>>();
+): TextPageModel {
+  const lineBuckets = new Map<number, TextCharBox[]>();
 
   textContent.items.forEach((item) => {
     if (!isTextItem(item)) return;
@@ -292,36 +313,114 @@ function buildTextLines(
     const left = tx[4];
     const top = tx[5];
     const width = Math.abs(item.width * viewport.scale);
-    const key = Math.round(top / 4) * 4;
-    const line = lines.get(key) ?? [];
-    line.push({ text, left, right: left + width });
-    lines.set(key, line);
+    const height = Math.max(Math.abs(item.height * viewport.scale), Math.hypot(tx[2], tx[3]), 8 * viewport.scale);
+    const lineStep = Math.max(4, height * 0.35);
+    const key = Math.round(top / lineStep) * lineStep;
+    const bucket = lineBuckets.get(key) ?? [];
+    const chars = Array.from(text);
+    const weights = chars.map(getTextCharWeight);
+    const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+    let cursor = left;
+    chars.forEach((char, offset) => {
+      const charWidth = width * (weights[offset] / totalWeight);
+      bucket.push({
+        char,
+        index: -1,
+        line: -1,
+        x: cursor,
+        y: top - height,
+        width: charWidth,
+        height
+      });
+      cursor += charWidth;
+    });
+    lineBuckets.set(key, bucket);
   });
 
-  return Array.from(lines.entries())
+  let fullText = "";
+  const chars: TextCharBox[] = [];
+  const lines = Array.from(lineBuckets.entries())
     .sort(([topA], [topB]) => topA - topB)
-    .map(([top, items]) => {
-      const sorted = items.sort((left, right) => left.left - right.left);
+    .map(([top, items], lineIndex) => {
+      const sorted = items.sort((left, right) => left.x - right.x);
+      const start = fullText.length;
+      const normalized = insertTextGapSpaces(sorted);
+      normalized.forEach((item) => {
+        const indexed = { ...item, index: fullText.length, line: lineIndex };
+        chars.push(indexed);
+        fullText += item.char;
+      });
+      const end = fullText.length;
+      fullText += "\n";
       return {
-        text: sorted.map((item) => item.text).join("").replace(/\s+/g, " ").trim(),
-        top,
-        left: Math.min(...sorted.map((item) => item.left)),
-        right: Math.max(...sorted.map((item) => item.right))
+        text: normalized.map((item) => item.char).join("").replace(/\s+/g, " ").trim(),
+        top: Math.min(...normalized.map((item) => item.y)),
+        bottom: Math.max(...normalized.map((item) => item.y + item.height)),
+        left: Math.min(...normalized.map((item) => item.x)),
+        right: Math.max(...normalized.map((item) => item.x + item.width)),
+        start,
+        end,
+        line: lineIndex
       };
     })
     .filter((line) => line.text);
+
+  return {
+    text: fullText.trimEnd(),
+    chars,
+    lines
+  };
 }
 
-function isTextItem(item: unknown): item is { str: string; transform: number[]; width: number } {
+function getTextCharWeight(char: string) {
+  if (/\s/.test(char)) return 0.42;
+  if (/[ilI1|.,:;!'"`]/.test(char)) return 0.46;
+  if (/[mwMW@%&]/.test(char)) return 1.38;
+  if (/[\u4e00-\u9fff]/.test(char)) return 1.05;
+  if (/[A-Z]/.test(char)) return 1.08;
+  return 1;
+}
+
+function insertTextGapSpaces(chars: TextCharBox[]) {
+  if (chars.length < 2) return chars;
+  const widths = chars.filter((char) => char.char.trim()).map((char) => char.width);
+  const averageWidth = widths.reduce((sum, width) => sum + width, 0) / Math.max(widths.length, 1);
+  const result: TextCharBox[] = [];
+
+  chars.forEach((char) => {
+    const previous = result[result.length - 1];
+    if (previous && previous.char.trim() && char.char.trim()) {
+      const gap = char.x - (previous.x + previous.width);
+      if (gap > averageWidth * 0.55) {
+        result.push({
+          char: " ",
+          index: -1,
+          line: -1,
+          x: previous.x + previous.width,
+          y: previous.y,
+          width: gap,
+          height: previous.height
+        });
+      }
+    }
+    result.push(char);
+  });
+
+  return result;
+}
+
+function isTextItem(item: unknown): item is { str: string; transform: number[]; width: number; height: number } {
   return (
     typeof item === "object" &&
     item !== null &&
     "str" in item &&
     "transform" in item &&
     "width" in item &&
+    "height" in item &&
     typeof (item as { str: unknown }).str === "string" &&
     Array.isArray((item as { transform: unknown }).transform) &&
-    typeof (item as { width: unknown }).width === "number"
+    typeof (item as { width: unknown }).width === "number" &&
+    typeof (item as { height: unknown }).height === "number"
   );
 }
 
@@ -348,6 +447,120 @@ function repairSelectionText(selection: TextSelectionState, lines: TextLine[] | 
   }
 
   return selection.text;
+}
+
+function hitTestTextChar(model: TextPageModel | null, point: { x: number; y: number }) {
+  if (!model?.chars.length) return null;
+  const pageAverageHeight =
+    model.chars.reduce((sum, char) => sum + char.height, 0) / Math.max(model.chars.length, 1);
+  const candidates = model.lines
+    .filter((candidate) => point.y >= candidate.top - pageAverageHeight * 0.35 && point.y <= candidate.bottom + pageAverageHeight * 0.45)
+    .sort((left, right) => Math.abs(point.y - (left.top + left.bottom) / 2) - Math.abs(point.y - (right.top + right.bottom) / 2));
+  const line =
+    candidates[0] ??
+    model.lines
+      .map((candidate) => ({
+        line: candidate,
+        distance: Math.abs(point.y - (candidate.top + candidate.bottom) / 2)
+      }))
+      .filter((candidate) => candidate.distance <= pageAverageHeight * 1.2)
+      .sort((left, right) => left.distance - right.distance)[0]?.line;
+  if (!line) return null;
+
+  const chars = model.chars.filter((char) => char.line === line.line);
+  if (!chars.length) return null;
+  const sorted = chars.sort((left, right) => left.x - right.x);
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  if (point.x <= first.x) return first.index;
+  if (point.x >= last.x + last.width) return last.index + 1;
+
+  const directHit = sorted.find((char) => point.x >= char.x && point.x <= char.x + char.width);
+  if (directHit) return point.x > directHit.x + directHit.width / 2 ? directHit.index + 1 : directHit.index;
+
+  for (let index = 0; index < sorted.length - 1; index += 1) {
+    const current = sorted[index];
+    const next = sorted[index + 1];
+    if (point.x > current.x + current.width && point.x < next.x) {
+      const middle = (current.x + current.width + next.x) / 2;
+      return point.x < middle ? current.index + 1 : next.index;
+    }
+  }
+
+  return last.index + 1;
+}
+
+function buildCustomTextSelection(
+  model: TextPageModel | null,
+  startIndex: number,
+  endIndex: number,
+  pageSize: { width: number; height: number }
+) {
+  if (!model) return null;
+  const range = snapTextSelectionRange(model.text, Math.min(startIndex, endIndex), Math.max(startIndex, endIndex));
+  const start = range.start;
+  const end = range.end;
+  if (end <= start) return null;
+
+  const selectedChars = model.chars.filter((char) => char.index >= start && char.index < end && char.char.trim());
+  if (!selectedChars.length) return null;
+
+  const rects = Array.from(new Set(selectedChars.map((char) => char.line))).map((line) => {
+    const lineChars = selectedChars.filter((char) => char.line === line);
+    const left = Math.min(...lineChars.map((char) => char.x));
+    const right = Math.max(...lineChars.map((char) => char.x + char.width));
+    const top = Math.min(...lineChars.map((char) => char.y));
+    const bottom = Math.max(...lineChars.map((char) => char.y + char.height));
+    const verticalPadding = Math.max(2, (bottom - top) * 0.14);
+    const horizontalPadding = Math.max(1, (bottom - top) * 0.04);
+    return {
+      x: Math.max(0, left - horizontalPadding) / pageSize.width,
+      y: Math.max(0, top - verticalPadding) / pageSize.height,
+      width: (Math.min(pageSize.width, right + horizontalPadding) - Math.max(0, left - horizontalPadding)) / pageSize.width,
+      height: (Math.min(pageSize.height, bottom + verticalPadding) - Math.max(0, top - verticalPadding)) / pageSize.height
+    };
+  });
+
+  const firstRect = rects[0];
+  const text = model.text.slice(start, end).replace(/\s+\n/g, "\n").trim();
+  if (!text) return null;
+  return {
+    text,
+    rects,
+    toolbarPoint: {
+      left: pageSize.width * (firstRect.x + firstRect.width / 2),
+      top: pageSize.height * firstRect.y
+    }
+  };
+}
+
+function snapTextSelectionRange(text: string, rawStart: number, rawEnd: number) {
+  let start = Math.max(0, rawStart);
+  let end = Math.min(text.length, rawEnd);
+  const prefixTrimmed = trimAccidentalLeadingWordTail(text, start, end);
+  start = prefixTrimmed.start;
+  end = prefixTrimmed.end;
+  const selected = text.slice(start, end);
+  const trimmed = selected.trim();
+  const isSingleWordSelection = Boolean(trimmed) && !/[\s\n]/.test(trimmed);
+  if (isSingleWordSelection) return { start, end };
+
+  return { start, end };
+}
+
+function trimAccidentalLeadingWordTail(text: string, start: number, end: number) {
+  const selected = text.slice(start, end);
+  const match = selected.match(/^([\p{L}\p{N}_-]{1,2})(\s+)([\p{L}\p{N}_-]{2,})(?=$|[^\p{L}\p{N}_-])/u);
+  if (!match) return { start, end };
+  const beforeStart = text[start - 1];
+  if (beforeStart && isTextWordChar(beforeStart)) {
+    return { start: start + match[1].length + match[2].length, end };
+  }
+  return { start, end };
+}
+
+function isTextWordChar(char: string | undefined) {
+  return Boolean(char && /[\p{L}\p{N}_-]/u.test(char));
 }
 
 function isSheetVisible(sheet: PaperSheetNote, visiblePages: number[]) {
@@ -419,7 +632,7 @@ export function App() {
   const [activePage, setActivePage] = useState(1);
   const [pageDraft, setPageDraft] = useState("1");
   const [pageSizes, setPageSizes] = useState<PageSizeMap>({});
-  const [textLinesByPage, setTextLinesByPage] = useState<Record<number, TextLine[]>>({});
+  const [textModelsByPage, setTextModelsByPage] = useState<Record<number, TextPageModel>>({});
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [appMetrics, setAppMetrics] = useState(getAppMetrics);
@@ -545,7 +758,7 @@ export function App() {
     setPdf(null);
     setPageSizes({});
     pageCanvasCacheRef.current.clear();
-    setTextLinesByPage({});
+    setTextModelsByPage({});
     setPaperKey(nextPaperKey);
     setSearchPages([]);
     setSearchQuery("");
@@ -1100,8 +1313,8 @@ export function App() {
         <div className="brand-block">
           <BookOpen size={20} />
           <div>
-            <strong>PDF Reading</strong>
-            <span>{paper ? paper.name : "本地论文阅读工作台"}</span>
+            <strong>Mutsumi</strong>
+            <span>{paper ? paper.name : "本地 PDF 阅读工作台"}</span>
           </div>
           <button className="brand-open-button" title="Open PDF" onClick={() => fileInputRef.current?.click()}>
             <FolderOpen size={17} />
@@ -1299,6 +1512,7 @@ export function App() {
             annotations={annotations}
             activeAnnotationId={activeAnnotationId}
             pendingAnnotationId={pendingAnnotationId}
+            textSelection={textSelection}
             onOpenFile={() => fileInputRef.current?.click()}
             onCreateAnnotation={addAnnotation}
             onCreateNote={createNoteForAnnotation}
@@ -1318,7 +1532,7 @@ export function App() {
             onZoomAnchor={(anchor) => {
               zoomAnchorRef.current = anchor;
             }}
-            onTextLines={(page, lines) => setTextLinesByPage((items) => (items[page] ? items : { ...items, [page]: lines }))}
+            onTextModel={(page, model) => setTextModelsByPage((items) => ({ ...items, [page]: model }))}
             zoomAnchorRef={zoomAnchorRef}
             onTextSelection={(selection) => {
               setTextSelection(selection);
@@ -1337,17 +1551,17 @@ export function App() {
             <TextSelectionToolbar
               selection={textSelection}
               onCopy={async () => {
-                await navigator.clipboard?.writeText(repairSelectionText(textSelection, textLinesByPage[textSelection.page]));
+                await navigator.clipboard?.writeText(repairSelectionText(textSelection, textModelsByPage[textSelection.page]?.lines));
                 setTextSelection(null);
               }}
               onTranslate={() => {
-                setAssistantDraft(createAssistantDraft("translate", repairSelectionText(textSelection, textLinesByPage[textSelection.page]), textSelection.page));
+                setAssistantDraft(createAssistantDraft("translate", repairSelectionText(textSelection, textModelsByPage[textSelection.page]?.lines), textSelection.page));
                 setLeftOpen(true);
                 setLeftPanelView("ai");
                 setTextSelection(null);
               }}
               onAsk={() => {
-                setAssistantDraft(createAssistantDraft("ask", repairSelectionText(textSelection, textLinesByPage[textSelection.page]), textSelection.page));
+                setAssistantDraft(createAssistantDraft("ask", repairSelectionText(textSelection, textModelsByPage[textSelection.page]?.lines), textSelection.page));
                 setLeftOpen(true);
                 setLeftPanelView("ai");
                 setTextSelection(null);
@@ -1514,6 +1728,7 @@ function PdfStage({
   annotations,
   activeAnnotationId,
   pendingAnnotationId,
+  textSelection,
   onOpenFile,
   onCreateAnnotation,
   onCreateNote,
@@ -1525,7 +1740,7 @@ function PdfStage({
   pageCanvasCache,
   onPageSize,
   onZoomAnchor,
-  onTextLines,
+  onTextModel,
   zoomAnchorRef,
   onTextSelection,
   onClearTextSelection,
@@ -1539,6 +1754,7 @@ function PdfStage({
   annotations: PaperAnnotation[];
   activeAnnotationId: string | null;
   pendingAnnotationId: string | null;
+  textSelection: TextSelectionState | null;
   onOpenFile: () => void;
   onCreateAnnotation: (page: number, rect: AnnotationRect) => void;
   onCreateNote: (id: string) => void;
@@ -1550,7 +1766,7 @@ function PdfStage({
   pageCanvasCache: PageCanvasCache;
   onPageSize: (page: number, size: { width: number; height: number }) => void;
   onZoomAnchor: (anchor: ZoomAnchor) => void;
-  onTextLines: (page: number, lines: TextLine[]) => void;
+  onTextModel: (page: number, model: TextPageModel) => void;
   zoomAnchorRef: React.MutableRefObject<ZoomAnchor | null>;
   onTextSelection: (selection: TextSelectionState) => void;
   onClearTextSelection: () => void;
@@ -1725,11 +1941,12 @@ function PdfStage({
                 .sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime())}
               activeAnnotationId={activeAnnotationId}
               pendingAnnotationId={pendingAnnotationId}
+              textSelection={textSelection?.page === pageNumber ? textSelection : null}
               onCreateAnnotation={onCreateAnnotation}
               onCreateNote={onCreateNote}
               onDeleteAnnotation={onDeleteAnnotation}
               onPageSize={onPageSize}
-              onTextLines={onTextLines}
+              onTextModel={onTextModel}
               onSelectAnnotation={(id) => {
                 onSetCurrentPage(pageNumber);
                 onSetActivePage(pageNumber);
@@ -1813,11 +2030,12 @@ function PdfPageView({
   noteOrder,
   activeAnnotationId,
   pendingAnnotationId,
+  textSelection,
   onCreateAnnotation,
   onCreateNote,
   onDeleteAnnotation,
   onPageSize,
-  onTextLines,
+  onTextModel,
   onSelectAnnotation,
   onTextSelection,
   onClearTextSelection,
@@ -1833,11 +2051,12 @@ function PdfPageView({
   noteOrder: PaperAnnotation[];
   activeAnnotationId: string | null;
   pendingAnnotationId: string | null;
+  textSelection: TextSelectionState | null;
   onCreateAnnotation: (page: number, rect: AnnotationRect) => void;
   onCreateNote: (id: string) => void;
   onDeleteAnnotation: (id: string) => void;
   onPageSize: (page: number, size: { width: number; height: number }) => void;
-  onTextLines: (page: number, lines: TextLine[]) => void;
+  onTextModel: (page: number, model: TextPageModel) => void;
   onSelectAnnotation: (id: string) => void;
   onTextSelection: (selection: TextSelectionState) => void;
   onClearTextSelection: () => void;
@@ -1847,7 +2066,11 @@ function PdfPageView({
   const textLayerRef = useRef<HTMLDivElement | null>(null);
   const [pageSize, setPageSize] = useState(initialPageSize ?? getFallbackPageSize(reading));
   const [draftRect, setDraftRect] = useState<AnnotationRect | null>(null);
+  const [textModel, setTextModel] = useState<TextPageModel | null>(null);
+  const [textSelectionDraft, setTextSelectionDraft] = useState<{ start: number; end: number } | null>(null);
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
+  const textDragStartRef = useRef<number | null>(null);
+  const textDragEndRef = useRef<number | null>(null);
   const scaleRef = useRef(reading.scale);
   const rotationRef = useRef(reading.rotation);
 
@@ -1930,7 +2153,11 @@ function PdfPageView({
       textLayer.render().catch(() => undefined);
 
       page.getTextContent().then((textContent) => {
-        if (!isCancelled) onTextLines(pageNumber, buildTextLines(textContent, viewport));
+        if (!isCancelled) {
+          const model = buildTextPageModel(textContent, viewport);
+          setTextModel(model);
+          onTextModel(pageNumber, model);
+        }
       }).catch(() => undefined);
     });
 
@@ -1949,9 +2176,11 @@ function PdfPageView({
 
   const getPoint = (event: React.PointerEvent<HTMLDivElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect();
+    const scaleX = bounds.width ? pageSize.width / bounds.width : 1;
+    const scaleY = bounds.height ? pageSize.height / bounds.height : 1;
     return {
-      x: Math.min(Math.max(event.clientX - bounds.left, 0), bounds.width),
-      y: Math.min(Math.max(event.clientY - bounds.top, 0), bounds.height)
+      x: Math.min(Math.max((event.clientX - bounds.left) * scaleX, 0), pageSize.width),
+      y: Math.min(Math.max((event.clientY - bounds.top) * scaleY, 0), pageSize.height)
     };
   };
 
@@ -1993,37 +2222,69 @@ function PdfPageView({
       <div
         className={`textLayer text-layer ${tool.mode === "select" ? "selectable" : ""}`}
         ref={textLayerRef}
-        onPointerUp={() => {
+        onPointerDown={(event) => {
           if (tool.mode !== "select") return;
-          window.setTimeout(() => {
-            const selection = window.getSelection();
-            const text = selection?.toString().trim();
-            if (!selection || !text || selection.rangeCount === 0) {
-              onClearTextSelection();
-              return;
+          event.preventDefault();
+          event.stopPropagation();
+          const start = hitTestTextChar(textModel, getPoint(event));
+          if (start === null) {
+            onClearTextSelection();
+            return;
+          }
+          event.currentTarget.setPointerCapture(event.pointerId);
+          textDragStartRef.current = start;
+          textDragEndRef.current = start;
+          setTextSelectionDraft({ start, end: start });
+          onClearTextSelection();
+        }}
+        onPointerMove={(event) => {
+          if (tool.mode !== "select" || textDragStartRef.current === null) return;
+          event.preventDefault();
+          const end = hitTestTextChar(textModel, getPoint(event));
+          if (end !== null) {
+            textDragEndRef.current = end;
+            setTextSelectionDraft({ start: textDragStartRef.current, end });
+          }
+        }}
+        onPointerUp={(event) => {
+          if (tool.mode !== "select" || textDragStartRef.current === null) return;
+          event.preventDefault();
+          event.stopPropagation();
+          const end = hitTestTextChar(textModel, getPoint(event)) ?? textDragEndRef.current;
+          const selection = end === null ? null : buildCustomTextSelection(textModel, textDragStartRef.current, end, pageSize);
+          textDragStartRef.current = null;
+          textDragEndRef.current = null;
+          setTextSelectionDraft(null);
+          if (!selection) {
+            onClearTextSelection();
+            return;
+          }
+          const bounds = event.currentTarget.getBoundingClientRect();
+          onTextSelection({
+            text: selection.text,
+            page: pageNumber,
+            rects: selection.rects,
+            position: {
+              left: bounds.left + selection.toolbarPoint.left,
+              top: Math.max(8, bounds.top + selection.toolbarPoint.top - 42)
             }
-
-            const textLayer = textLayerRef.current;
-            const anchorNode = selection.anchorNode;
-            const focusNode = selection.focusNode;
-            if (!textLayer || !anchorNode || !focusNode || !textLayer.contains(anchorNode) || !textLayer.contains(focusNode)) {
-              onClearTextSelection();
-              return;
-            }
-
-            const range = selection.getRangeAt(0);
-            const rect = range.getBoundingClientRect();
-            onTextSelection({
-              text,
-              page: pageNumber,
-              position: {
-                left: rect.left + rect.width / 2,
-                top: Math.max(8, rect.top - 42)
-              }
-            });
-          }, 0);
+          });
         }}
       />
+      {tool.mode === "select" && textSelectionDraft && (
+        <div className="custom-text-selection-layer">
+          {buildCustomTextSelection(textModel, textSelectionDraft.start, textSelectionDraft.end, pageSize)?.rects.map((rect, index) => (
+            <div className="custom-text-selection" key={index} style={rectToStyle(rect, pageSize)} />
+          ))}
+        </div>
+      )}
+      {tool.mode === "select" && !textSelectionDraft && textSelection?.rects?.length ? (
+        <div className="custom-text-selection-layer">
+          {textSelection.rects.map((rect, index) => (
+            <div className="custom-text-selection settled" key={index} style={rectToStyle(rect, pageSize)} />
+          ))}
+        </div>
+      ) : null}
       <div className="annotation-layer">
         {annotations.map((annotation) => {
           const noteIndex = noteOrder.findIndex((item) => item.id === annotation.id) + 1;
