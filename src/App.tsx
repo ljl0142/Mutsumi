@@ -88,16 +88,71 @@ type TextCharBox = {
   char: string;
   index: number;
   line: number;
+  run: number;
+  offset: number;
   x: number;
   y: number;
   width: number;
   height: number;
 };
 
+type TextRun = {
+  id: number;
+  line: number;
+  text: string;
+  start: number;
+  end: number;
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  chars: TextCharBox[];
+};
+
+type TextWord = {
+  text: string;
+  line: number;
+  start: number;
+  end: number;
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+};
+
 type TextPageModel = {
   text: string;
   chars: TextCharBox[];
   lines: TextLine[];
+  runs: TextRun[];
+  words: TextWord[];
+  source?: "pdfjs" | "pdfium" | "hybrid" | "ocr";
+};
+
+type PdfiumRenderResult = {
+  available: boolean;
+  page: number;
+  width: number;
+  height: number;
+  image?: string;
+  bitmap?: {
+    data: string;
+    width: number;
+    height: number;
+    stride: number;
+    mode: string;
+  };
+  textModel?: unknown;
+};
+
+type PdfiumTextSelectionResult = {
+  available: boolean;
+  page: number;
+  empty?: boolean;
+  text?: string;
+  start?: number;
+  end?: number;
+  rects?: Array<{ x: number; y: number; width: number; height: number }>;
 };
 
 type AssistantDraft = {
@@ -300,66 +355,106 @@ function getVisibleAnnotationPages(reading: ReadingState) {
 }
 
 function buildTextPageModel(
-  textContent: { items: Array<unknown> },
+  textContent: { items: Array<unknown>; styles?: Record<string, { fontFamily?: string }> },
   viewport: pdfjsLib.PageViewport
 ): TextPageModel {
-  const lineBuckets = new Map<number, TextCharBox[]>();
+  const runBuckets = new Map<number, Array<Omit<TextRun, "start" | "end" | "line">>>();
 
-  textContent.items.forEach((item) => {
+  textContent.items.forEach((item, itemIndex) => {
     if (!isTextItem(item)) return;
-    const text = item.str;
-    if (!text.trim()) return;
+    const rawText = item.str;
+    const text = rawText.trim();
+    if (!text) return;
     const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
-    const left = tx[4];
+    const rawLeft = tx[4];
     const top = tx[5];
-    const width = Math.abs(item.width * viewport.scale);
+    const rawWidth = Math.abs(item.width * viewport.scale);
     const height = Math.max(Math.abs(item.height * viewport.scale), Math.hypot(tx[2], tx[3]), 8 * viewport.scale);
+    const fontFamily = textContent.styles?.[item.fontName ?? ""]?.fontFamily ?? "serif";
+    const fontSize = Math.max(Math.hypot(tx[2], tx[3]), Math.abs(item.height * viewport.scale), 8 * viewport.scale);
+    const metrics = trimTextItemGeometry(rawText, rawLeft, rawWidth, fontSize, fontFamily);
+    const left = metrics.left;
+    const width = metrics.width;
     const lineStep = Math.max(4, height * 0.35);
     const key = Math.round(top / lineStep) * lineStep;
-    const bucket = lineBuckets.get(key) ?? [];
+    const bucket = runBuckets.get(key) ?? [];
     const chars = Array.from(text);
-    const weights = chars.map(getTextCharWeight);
+    const weights = getTextCharWeights(text, fontSize, fontFamily);
     const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || 1;
     let cursor = left;
-    chars.forEach((char, offset) => {
+    const runChars = chars.map((char, offset) => {
       const charWidth = width * (weights[offset] / totalWeight);
-      bucket.push({
+      const box = {
         char,
         index: -1,
         line: -1,
+        run: itemIndex,
+        offset,
         x: cursor,
         y: top - height,
         width: charWidth,
         height
-      });
+      };
       cursor += charWidth;
+      return box;
     });
-    lineBuckets.set(key, bucket);
+    bucket.push({
+      id: itemIndex,
+      text,
+      left,
+      right: left + width,
+      top: top - height,
+      bottom: top,
+      chars: runChars
+    });
+    runBuckets.set(key, bucket);
   });
 
   let fullText = "";
   const chars: TextCharBox[] = [];
-  const lines = Array.from(lineBuckets.entries())
+  const runs: TextRun[] = [];
+  const lines = Array.from(runBuckets.entries())
     .sort(([topA], [topB]) => topA - topB)
-    .map(([top, items], lineIndex) => {
-      const sorted = items.sort((left, right) => left.x - right.x);
-      const start = fullText.length;
-      const normalized = insertTextGapSpaces(sorted);
-      normalized.forEach((item) => {
-        const indexed = { ...item, index: fullText.length, line: lineIndex };
-        chars.push(indexed);
-        fullText += item.char;
+    .map(([, items], lineIndex) => {
+      const sortedRuns = items.sort((left, right) => left.left - right.left);
+      const lineStart = fullText.length;
+      const averageWidth = getAverageRunCharWidth(sortedRuns);
+
+      sortedRuns.forEach((run, runIndex) => {
+        const previous = sortedRuns[runIndex - 1];
+        if (previous) {
+          const gap = run.left - previous.right;
+          if (gap > averageWidth * 0.55) fullText += " ";
+        }
+
+        const start = fullText.length;
+        const indexedChars = run.chars.map((char) => ({
+          ...char,
+          index: start + char.offset,
+          line: lineIndex
+        }));
+        indexedChars.forEach((char) => chars.push(char));
+        fullText += run.text;
+        runs.push({
+          ...run,
+          line: lineIndex,
+          start,
+          end: fullText.length,
+          chars: indexedChars
+        });
       });
-      const end = fullText.length;
+
+      const lineEnd = fullText.length;
       fullText += "\n";
+      const lineChars = chars.filter((char) => char.line === lineIndex);
       return {
-        text: normalized.map((item) => item.char).join("").replace(/\s+/g, " ").trim(),
-        top: Math.min(...normalized.map((item) => item.y)),
-        bottom: Math.max(...normalized.map((item) => item.y + item.height)),
-        left: Math.min(...normalized.map((item) => item.x)),
-        right: Math.max(...normalized.map((item) => item.x + item.width)),
-        start,
-        end,
+        text: fullText.slice(lineStart, lineEnd).replace(/\s+/g, " ").trim(),
+        top: Math.min(...lineChars.map((item) => item.y)),
+        bottom: Math.max(...lineChars.map((item) => item.y + item.height)),
+        left: Math.min(...lineChars.map((item) => item.x)),
+        right: Math.max(...lineChars.map((item) => item.x + item.width)),
+        start: lineStart,
+        end: lineEnd,
         line: lineIndex
       };
     })
@@ -368,8 +463,306 @@ function buildTextPageModel(
   return {
     text: fullText.trimEnd(),
     chars,
-    lines
+    lines,
+    runs,
+    words: buildTextWords(fullText.trimEnd(), chars),
+    source: "pdfjs"
   };
+}
+
+function isTextPageModel(value: unknown): value is TextPageModel {
+  if (typeof value !== "object" || value === null) return false;
+  const model = value as Partial<TextPageModel>;
+  return (
+    typeof model.text === "string" &&
+    isReadableTextModel(model.text) &&
+    Array.isArray(model.chars) &&
+    model.chars.length > 0 &&
+    Array.isArray(model.lines) &&
+    model.lines.length > 0 &&
+    Array.isArray(model.runs)
+  );
+}
+
+function isPdfiumRenderResult(value: unknown): value is PdfiumRenderResult {
+  if (typeof value !== "object" || value === null) return false;
+  const result = value as Partial<PdfiumRenderResult>;
+  return (
+    result.available === true &&
+    typeof result.width === "number" &&
+    typeof result.height === "number" &&
+    (typeof result.image === "string" ||
+      (
+        typeof result.bitmap === "object" &&
+        result.bitmap !== null &&
+        typeof result.bitmap.data === "string" &&
+        typeof result.bitmap.width === "number" &&
+        typeof result.bitmap.height === "number" &&
+        typeof result.bitmap.stride === "number" &&
+        typeof result.bitmap.mode === "string"
+      ))
+  );
+}
+
+function isPdfiumTextSelectionResult(value: unknown): value is PdfiumTextSelectionResult {
+  if (typeof value !== "object" || value === null) return false;
+  const result = value as Partial<PdfiumTextSelectionResult>;
+  return result.available === true && (result.empty === true || (typeof result.text === "string" && Array.isArray(result.rects)));
+}
+
+function scaleTextPageModel(model: TextPageModel, factor: number): TextPageModel {
+  if (factor === 1) return model;
+  const scaleChar = (char: TextCharBox): TextCharBox => ({
+    ...char,
+    x: char.x * factor,
+    y: char.y * factor,
+    width: char.width * factor,
+    height: char.height * factor
+  });
+  const scaleLine = (line: TextLine): TextLine => ({
+    ...line,
+    top: line.top * factor,
+    bottom: line.bottom * factor,
+    left: line.left * factor,
+    right: line.right * factor
+  });
+  const scaleRun = (run: TextRun): TextRun => ({
+    ...run,
+    top: run.top * factor,
+    bottom: run.bottom * factor,
+    left: run.left * factor,
+    right: run.right * factor,
+    chars: run.chars.map(scaleChar)
+  });
+  const scaleWord = (word: TextWord): TextWord => ({
+    ...word,
+    top: word.top * factor,
+    bottom: word.bottom * factor,
+    left: word.left * factor,
+    right: word.right * factor
+  });
+
+  return {
+    ...model,
+    chars: model.chars.map(scaleChar),
+    lines: model.lines.map(scaleLine),
+    runs: model.runs.map(scaleRun),
+    words: model.words.map(scaleWord)
+  };
+}
+
+function isReadableTextModel(text: string) {
+  const compact = text.replace(/\s+/g, "");
+  if (compact.length < 16) return false;
+  const letters = compact.match(/[A-Za-z]/g)?.length ?? 0;
+  if (letters / compact.length < 0.55) return true;
+
+  const words = text.match(/[A-Za-z]{2,}/g) ?? [];
+  const singleLetters = text.match(/\b[A-Za-z]\b/g)?.length ?? 0;
+  return words.length >= Math.max(4, singleLetters * 0.35);
+}
+
+function isCompatibleTextModel(candidate: TextPageModel, reference: TextPageModel) {
+  const referenceWords = getComparableWords(reference.text);
+  const candidateWords = getComparableWords(candidate.text);
+  if (referenceWords.length < 20 || candidateWords.length < 20) return true;
+
+  const referenceSet = new Set(referenceWords.slice(0, 360));
+  const candidateSet = new Set(candidateWords.slice(0, 360));
+  const overlap = Array.from(candidateSet).filter((word) => referenceSet.has(word)).length;
+  return overlap / Math.min(referenceSet.size, candidateSet.size) >= 0.28;
+}
+
+function isSpatiallyReliableTextModel(candidate: TextPageModel, reference: TextPageModel) {
+  if (!candidate.lines.length || !candidate.chars.length) return false;
+  const lineRatio = candidate.lines.length / Math.max(reference.lines.length, 1);
+  if (lineRatio < 0.45 || lineRatio > 1.85) return false;
+
+  const candidateBounds = getModelBounds(candidate);
+  const referenceBounds = getModelBounds(reference);
+  if (!candidateBounds || !referenceBounds) return false;
+
+  const widthRatio = candidateBounds.width / Math.max(referenceBounds.width, 1);
+  const heightRatio = candidateBounds.height / Math.max(referenceBounds.height, 1);
+  if (widthRatio < 0.45 || widthRatio > 1.45) return false;
+  if (heightRatio < 0.45 || heightRatio > 1.45) return false;
+
+  const centerDeltaY = Math.abs(candidateBounds.centerY - referenceBounds.centerY);
+  if (centerDeltaY > Math.max(48, referenceBounds.height * 0.18)) return false;
+
+  const heights = candidate.lines.map((line) => line.bottom - line.top).filter((height) => Number.isFinite(height) && height > 0);
+  if (!heights.length) return false;
+  const medianHeight = median(heights);
+  const oddHeights = heights.filter((height) => height > medianHeight * 4 || height < medianHeight * 0.18).length;
+  if (oddHeights / heights.length > 0.28) return false;
+
+  const badChars = candidate.chars.filter(
+    (char) =>
+      !Number.isFinite(char.x) ||
+      !Number.isFinite(char.y) ||
+      !Number.isFinite(char.width) ||
+      !Number.isFinite(char.height) ||
+      char.width <= 0 ||
+      char.height <= 0
+  ).length;
+  return badChars / candidate.chars.length < 0.02;
+}
+
+function alignTextModelYToReference(candidate: TextPageModel, reference: TextPageModel): TextPageModel {
+  const lineDeltas = new Map<number, number>();
+
+  candidate.lines.forEach((candidateLine, index) => {
+    const referenceLine = findReferenceLineForAlignment(candidateLine, reference.lines, index);
+    if (!referenceLine) return;
+    const candidateCenter = (candidateLine.top + candidateLine.bottom) / 2;
+    const referenceCenter = (referenceLine.top + referenceLine.bottom) / 2;
+    lineDeltas.set(candidateLine.line, referenceCenter - candidateCenter);
+  });
+
+  if (!lineDeltas.size) return candidate;
+
+  const lines = candidate.lines.map((line) => {
+    const delta = lineDeltas.get(line.line) ?? 0;
+    return {
+      ...line,
+      top: line.top + delta,
+      bottom: line.bottom + delta
+    };
+  });
+  const chars = candidate.chars.map((char) => ({
+    ...char,
+    y: char.y + (lineDeltas.get(char.line) ?? 0)
+  }));
+  const runs = candidate.runs.map((run) => {
+    const delta = lineDeltas.get(run.line) ?? 0;
+    return {
+      ...run,
+      top: run.top + delta,
+      bottom: run.bottom + delta,
+      chars: run.chars.map((char) => ({
+        ...char,
+        y: char.y + delta
+      }))
+    };
+  });
+
+  return {
+    ...candidate,
+    chars,
+    lines,
+    runs,
+    words: buildTextWords(candidate.text, chars)
+  };
+}
+
+function findReferenceLineForAlignment(candidateLine: TextLine, referenceLines: TextLine[], index: number) {
+  const normalized = normalizeTextLineForAlignment(candidateLine.text);
+  if (normalized.length >= 12) {
+    const exact = referenceLines.find((line) => normalizeTextLineForAlignment(line.text) === normalized);
+    if (exact) return exact;
+  }
+
+  return referenceLines[index] ?? null;
+}
+
+function normalizeTextLineForAlignment(text: string) {
+  return text.replace(/\u0002/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function getModelBounds(model: TextPageModel) {
+  const visibleChars = model.chars.filter((char) => char.char.trim());
+  if (!visibleChars.length) return null;
+  const left = Math.min(...visibleChars.map((char) => char.x));
+  const right = Math.max(...visibleChars.map((char) => char.x + char.width));
+  const top = Math.min(...visibleChars.map((char) => char.y));
+  const bottom = Math.max(...visibleChars.map((char) => char.y + char.height));
+  return {
+    left,
+    right,
+    top,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+    centerY: (top + bottom) / 2
+  };
+}
+
+function median(values: number[]) {
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.floor(sorted.length / 2)] ?? 0;
+}
+
+function shouldTryOcrFallback(model: TextPageModel) {
+  const compact = model.text.replace(/\s+/g, "");
+  if (compact.length < 24) return true;
+  if (!model.words.length) return true;
+
+  const replacementCount = (model.text.match(/\uFFFD/g) ?? []).length;
+  const controlCount = (model.text.match(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g) ?? []).length;
+  const badRatio = (replacementCount + controlCount) / Math.max(model.text.length, 1);
+  return badRatio > 0.02;
+}
+
+function getComparableWords(text: string) {
+  return text
+    .toLowerCase()
+    .match(/[a-z]{3,}/g) ?? [];
+}
+
+function buildTextWords(text: string, chars: TextCharBox[]) {
+  const words: TextWord[] = [];
+  const lines = Array.from(new Set(chars.map((char) => char.line)));
+
+  lines.forEach((line) => {
+    const lineChars = chars
+      .filter((char) => char.line === line)
+      .sort((left, right) => left.index - right.index);
+    let current: TextCharBox[] = [];
+
+    const pushWord = () => {
+      if (!current.length) return;
+      const start = current[0].index;
+      const last = current[current.length - 1];
+      const end = extendWordEnd(text, last.index + 1);
+      words.push({
+        text: text.slice(start, end),
+        line,
+        start,
+        end,
+        left: Math.min(...current.map((char) => char.x)),
+        right: Math.max(...current.map((char) => char.x + char.width)),
+        top: Math.min(...current.map((char) => char.y)),
+        bottom: Math.max(...current.map((char) => char.y + char.height))
+      });
+      current = [];
+    };
+
+    lineChars.forEach((char) => {
+      if (isWordSelectionChar(char.char)) {
+        current.push(char);
+      } else {
+        pushWord();
+      }
+    });
+    pushWord();
+  });
+
+  return words.filter((word) => word.text.trim());
+}
+
+function isWordSelectionChar(char: string) {
+  return /[A-Za-z0-9\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u4e00-\u9fff]/.test(char);
+}
+
+function extendWordEnd(text: string, rawEnd: number) {
+  let end = rawEnd;
+  while (end < text.length && /['’.,;:!?%)]/.test(text[end])) end += 1;
+  return end;
+}
+
+function getAverageRunCharWidth(runs: Array<{ chars: TextCharBox[] }>) {
+  const widths = runs.flatMap((run) => run.chars.filter((char) => char.char.trim()).map((char) => char.width));
+  return widths.reduce((sum, width) => sum + width, 0) / Math.max(widths.length, 1);
 }
 
 function getTextCharWeight(char: string) {
@@ -381,35 +774,48 @@ function getTextCharWeight(char: string) {
   return 1;
 }
 
-function insertTextGapSpaces(chars: TextCharBox[]) {
-  if (chars.length < 2) return chars;
-  const widths = chars.filter((char) => char.char.trim()).map((char) => char.width);
-  const averageWidth = widths.reduce((sum, width) => sum + width, 0) / Math.max(widths.length, 1);
-  const result: TextCharBox[] = [];
+const textMeasureCanvas = document.createElement("canvas");
+const textMeasureContext = textMeasureCanvas.getContext("2d");
+const textMeasureCache = new Map<string, number[]>();
 
-  chars.forEach((char) => {
-    const previous = result[result.length - 1];
-    if (previous && previous.char.trim() && char.char.trim()) {
-      const gap = char.x - (previous.x + previous.width);
-      if (gap > averageWidth * 0.55) {
-        result.push({
-          char: " ",
-          index: -1,
-          line: -1,
-          x: previous.x + previous.width,
-          y: previous.y,
-          width: gap,
-          height: previous.height
-        });
-      }
-    }
-    result.push(char);
+function getTextCharWeights(text: string, fontSize: number, fontFamily: string) {
+  const cacheKey = `${fontSize.toFixed(2)}:${fontFamily}:${text}`;
+  const cached = textMeasureCache.get(cacheKey);
+  if (cached) return cached;
+
+  const fallback = Array.from(text).map(getTextCharWeight);
+  if (!textMeasureContext) return fallback;
+
+  textMeasureContext.font = `${fontSize}px ${fontFamily}`;
+  const chars = Array.from(text);
+  const weights = chars.map((char, index) => {
+    const before = textMeasureContext.measureText(chars.slice(0, index).join("")).width;
+    const after = textMeasureContext.measureText(chars.slice(0, index + 1).join("")).width;
+    const width = after - before;
+    return width > 0 ? width : getTextCharWeight(char);
   });
-
-  return result;
+  textMeasureCache.set(cacheKey, weights);
+  return weights;
 }
 
-function isTextItem(item: unknown): item is { str: string; transform: number[]; width: number; height: number } {
+function trimTextItemGeometry(text: string, left: number, width: number, fontSize: number, fontFamily: string) {
+  const leading = text.match(/^\s*/)?.[0] ?? "";
+  const trailing = text.match(/\s*$/)?.[0] ?? "";
+  if (!leading && !trailing) return { left, width };
+
+  const weights = getTextCharWeights(text, fontSize, fontFamily);
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+  const leadingWeight = weights.slice(0, Array.from(leading).length).reduce((sum, weight) => sum + weight, 0);
+  const trailingWeight = weights.slice(weights.length - Array.from(trailing).length).reduce((sum, weight) => sum + weight, 0);
+  const leadingWidth = width * (leadingWeight / totalWeight);
+  const trailingWidth = width * (trailingWeight / totalWeight);
+  return {
+    left: left + leadingWidth,
+    width: Math.max(1, width - leadingWidth - trailingWidth)
+  };
+}
+
+function isTextItem(item: unknown): item is { str: string; transform: number[]; width: number; height: number; fontName?: string } {
   return (
     typeof item === "object" &&
     item !== null &&
@@ -420,7 +826,8 @@ function isTextItem(item: unknown): item is { str: string; transform: number[]; 
     typeof (item as { str: unknown }).str === "string" &&
     Array.isArray((item as { transform: unknown }).transform) &&
     typeof (item as { width: unknown }).width === "number" &&
-    typeof (item as { height: unknown }).height === "number"
+    typeof (item as { height: unknown }).height === "number" &&
+    (!("fontName" in item) || typeof (item as { fontName: unknown }).fontName === "string")
   );
 }
 
@@ -449,38 +856,83 @@ function repairSelectionText(selection: TextSelectionState, lines: TextLine[] | 
   return selection.text;
 }
 
-function hitTestTextChar(model: TextPageModel | null, point: { x: number; y: number }) {
+function hitTestTextChar(
+  model: TextPageModel | null,
+  point: { x: number; y: number },
+  affinity: "normal" | "start" | "forwardEnd" | "backwardEnd" = "normal"
+) {
   if (!model?.chars.length) return null;
-  const pageAverageHeight =
-    model.chars.reduce((sum, char) => sum + char.height, 0) / Math.max(model.chars.length, 1);
-  const candidates = model.lines
-    .filter((candidate) => point.y >= candidate.top - pageAverageHeight * 0.35 && point.y <= candidate.bottom + pageAverageHeight * 0.45)
-    .sort((left, right) => Math.abs(point.y - (left.top + left.bottom) / 2) - Math.abs(point.y - (right.top + right.bottom) / 2));
-  const line =
-    candidates[0] ??
-    model.lines
-      .map((candidate) => ({
-        line: candidate,
-        distance: Math.abs(point.y - (candidate.top + candidate.bottom) / 2)
-      }))
-      .filter((candidate) => candidate.distance <= pageAverageHeight * 1.2)
-      .sort((left, right) => left.distance - right.distance)[0]?.line;
+  if (model.source === "pdfium") return hitTestPdfiumTextChar(model, point, affinity);
+
+  const wordBoundary = hitTestTextWordBoundary(model, point, affinity);
+  if (wordBoundary !== null) return wordBoundary;
+
+  const line = pickTextLineAtPoint(model, point);
   if (!line) return null;
 
-  const chars = model.chars.filter((char) => char.line === line.line);
-  if (!chars.length) return null;
-  const sorted = chars.sort((left, right) => left.x - right.x);
+  const sorted = model.chars.filter((char) => char.line === line.line).sort((left, right) => left.x - right.x || left.index - right.index);
+  if (!sorted.length) return null;
   const first = sorted[0];
   const last = sorted[sorted.length - 1];
   if (point.x <= first.x) return first.index;
   if (point.x >= last.x + last.width) return last.index + 1;
 
-  const directHit = sorted.find((char) => point.x >= char.x && point.x <= char.x + char.width);
-  if (directHit) return point.x > directHit.x + directHit.width / 2 ? directHit.index + 1 : directHit.index;
+  const directHit = getNearestTextChar(sorted.filter((char) => point.x >= char.x && point.x <= char.x + char.width), point.x);
+  if (directHit) {
+    if (affinity === "start") return directHit.index;
+    if (affinity === "forwardEnd") {
+      const previous = model.chars.find((char) => char.index === directHit.index - 1);
+      const isWordStart = Boolean(previous && /\s/.test(previous.char) && directHit.char.trim());
+      const threshold = isWordStart ? 1 : 0.96;
+      return point.x > directHit.x + directHit.width * threshold ? directHit.index + 1 : directHit.index;
+    }
+    if (affinity === "backwardEnd") return point.x > directHit.x + directHit.width * 0.18 ? directHit.index + 1 : directHit.index;
+    return point.x > directHit.x + directHit.width / 2 ? directHit.index + 1 : directHit.index;
+  }
 
   for (let index = 0; index < sorted.length - 1; index += 1) {
     const current = sorted[index];
     const next = sorted[index + 1];
+    if (point.x > current.x + current.width && point.x < next.x) {
+      if (affinity === "forwardEnd") return current.index + 1;
+      if (affinity === "backwardEnd") return next.index;
+      const middle = (current.x + current.width + next.x) / 2;
+      return point.x < middle ? current.index + 1 : next.index;
+    }
+  }
+
+  return last.index + 1;
+}
+
+function hitTestPdfiumTextChar(
+  model: TextPageModel,
+  point: { x: number; y: number },
+  affinity: "normal" | "start" | "forwardEnd" | "backwardEnd"
+) {
+  const line = pickPdfiumTextLineAtPoint(model, point);
+  if (!line) return null;
+
+  const chars = model.chars
+    .filter((char) => char.line === line.line && char.char.trim() && char.width > 0)
+    .sort((left, right) => left.x - right.x || left.index - right.index);
+  if (!chars.length) return null;
+
+  const first = chars[0];
+  const last = chars[chars.length - 1];
+  if (point.x <= first.x) return first.index;
+  if (point.x >= last.x + last.width) return last.index + 1;
+
+  const hit = chars.find((char) => point.x >= char.x && point.x <= char.x + char.width);
+  if (hit) {
+    const ratio = hit.width > 0 ? (point.x - hit.x) / hit.width : 0;
+    if (affinity === "start") return ratio > 0.5 ? hit.index + 1 : hit.index;
+    if (affinity === "backwardEnd") return ratio > 0.5 ? hit.index + 1 : hit.index;
+    return ratio >= 0.5 ? hit.index + 1 : hit.index;
+  }
+
+  for (let index = 0; index < chars.length - 1; index += 1) {
+    const current = chars[index];
+    const next = chars[index + 1];
     if (point.x > current.x + current.width && point.x < next.x) {
       const middle = (current.x + current.width + next.x) / 2;
       return point.x < middle ? current.index + 1 : next.index;
@@ -488,6 +940,176 @@ function hitTestTextChar(model: TextPageModel | null, point: { x: number; y: num
   }
 
   return last.index + 1;
+}
+
+function hitTestTextWordBoundary(
+  model: TextPageModel,
+  point: { x: number; y: number },
+  affinity: "normal" | "start" | "forwardEnd" | "backwardEnd"
+) {
+  if (!model.words?.length) return null;
+  const selectedLine = pickTextLineAtPoint(model, point);
+  const line = selectedLine?.line;
+  const lineWords = model.words
+    .filter((word) => word.line === line)
+    .sort((left, right) => left.left - right.left || left.start - right.start);
+  if (!lineWords.length) return null;
+
+  const first = lineWords[0];
+  const last = lineWords[lineWords.length - 1];
+  if (point.x <= first.left) return first.start;
+  if (point.x >= last.right) return last.end;
+
+  const hit = lineWords.find((word) => point.x >= word.left && point.x <= word.right);
+  if (hit) {
+    return hitTestTextWordCharacterBoundary(model, hit, point.x, affinity);
+  }
+
+  for (let index = 0; index < lineWords.length - 1; index += 1) {
+    const current = lineWords[index];
+    const next = lineWords[index + 1];
+    if (point.x > current.right && point.x < next.left) {
+      if (affinity === "forwardEnd") return current.end;
+      if (affinity === "backwardEnd") return next.start;
+      const middle = (current.right + next.left) / 2;
+      return point.x < middle ? current.end : next.start;
+    }
+  }
+
+  return null;
+}
+
+function pickTextLineAtPoint(model: TextPageModel, point: { x: number; y: number }) {
+  if (!model.lines.length) return null;
+  const visibleChars = model.chars.filter((char) => char.char.trim() && char.width > 0 && char.height > 0);
+  const charWidths = visibleChars.map((char) => char.width).filter((width) => Number.isFinite(width) && width > 0);
+  const xSlop = Math.max(2, median(charWidths) * 0.65);
+  const nearbyChars = visibleChars.filter((char) => point.x >= char.x - xSlop && point.x <= char.x + char.width + xSlop);
+  if (nearbyChars.length) {
+    const closestChar = nearbyChars
+      .map((char) => {
+        const dx = point.x < char.x ? char.x - point.x : point.x > char.x + char.width ? point.x - (char.x + char.width) : 0;
+        const dy = point.y < char.y ? char.y - point.y : point.y > char.y + char.height ? point.y - (char.y + char.height) : 0;
+        const centerY = char.y + char.height / 2;
+        return {
+          char,
+          score: dx * 0.35 + (dy > 0 ? dy : Math.abs(point.y - centerY) * 0.18)
+        };
+      })
+      .sort((left, right) => left.score - right.score || left.char.index - right.char.index)[0]?.char;
+    const line = model.lines.find((item) => item.line === closestChar?.line);
+    if (line) return line;
+  }
+
+  const sortedLines = model.lines
+    .map((line) => ({
+      ...line,
+      center: (line.top + line.bottom) / 2
+    }))
+    .sort((left, right) => left.center - right.center);
+
+  for (let index = 0; index < sortedLines.length; index += 1) {
+    const previous = sortedLines[index - 1];
+    const current = sortedLines[index];
+    const next = sortedLines[index + 1];
+    const upper = previous ? (previous.center + current.center) / 2 : current.top - getLineFallbackHalfHeight(model);
+    const lower = next ? (current.center + next.center) / 2 : current.bottom + getLineFallbackHalfHeight(model);
+    if (point.y >= upper && point.y < lower) return current;
+  }
+
+  return sortedLines
+    .map((line) => ({ line, distance: Math.abs(point.y - line.center) }))
+    .sort((left, right) => left.distance - right.distance)[0]?.line ?? null;
+}
+
+function pickPdfiumTextLineAtPoint(model: TextPageModel, point: { x: number; y: number }) {
+  const lineStats = model.lines
+    .map((line) => {
+      const chars = model.chars.filter((char) => char.line === line.line && char.char.trim() && char.width > 0 && char.height > 0);
+      if (!chars.length) return null;
+      const centers = chars.map((char) => char.y + char.height / 2).sort((left, right) => left - right);
+      return {
+        line,
+        center: median(centers),
+        top: Math.min(...chars.map((char) => char.y)),
+        bottom: Math.max(...chars.map((char) => char.y + char.height)),
+        left: Math.min(...chars.map((char) => char.x)),
+        right: Math.max(...chars.map((char) => char.x + char.width))
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    .sort((left, right) => left.center - right.center);
+
+  if (!lineStats.length) return null;
+
+  const charWidths = model.chars
+    .filter((char) => char.char.trim() && char.width > 0)
+    .map((char) => char.width);
+  const xSlop = Math.max(6, median(charWidths) * 1.5);
+  const xCandidates = lineStats.filter((line) => point.x >= line.left - xSlop && point.x <= line.right + xSlop);
+  const candidates = xCandidates.length ? xCandidates : lineStats;
+
+  return candidates
+    .map((line) => {
+      const insideY = point.y >= line.top && point.y <= line.bottom;
+      return {
+        line: line.line,
+        distance: insideY ? 0 : Math.abs(point.y - line.center)
+      };
+    })
+    .sort((left, right) => left.distance - right.distance || left.line.line - right.line.line)[0]?.line ?? null;
+}
+
+function getLineFallbackHalfHeight(model: TextPageModel) {
+  const heights = model.lines.map((line) => line.bottom - line.top).filter((height) => Number.isFinite(height) && height > 0);
+  return Math.max(8, median(heights) * 0.9);
+}
+
+function hitTestTextWordCharacterBoundary(
+  model: TextPageModel,
+  word: TextWord,
+  x: number,
+  affinity: "normal" | "start" | "forwardEnd" | "backwardEnd"
+) {
+  const chars = model.chars
+    .filter((char) => char.index >= word.start && char.index < word.end && char.char.trim())
+    .sort((left, right) => left.index - right.index);
+  if (!chars.length) return affinity === "forwardEnd" ? word.end : word.start;
+
+  const first = chars[0];
+  const last = chars[chars.length - 1];
+  if (x <= first.x) return word.start;
+  if (x >= last.x + last.width) return word.end;
+
+  const hit = chars.find((char) => x >= char.x && x <= char.x + char.width);
+  if (hit) {
+    const ratio = hit.width > 0 ? (x - hit.x) / hit.width : 0;
+    if (affinity === "start") return ratio > 0.72 ? hit.index + 1 : hit.index;
+    if (affinity === "forwardEnd") return ratio > 0.38 ? Math.min(hit.index + 1, word.end) : hit.index;
+    if (affinity === "backwardEnd") return ratio > 0.62 ? Math.min(hit.index + 1, word.end) : hit.index;
+    return ratio > 0.5 ? Math.min(hit.index + 1, word.end) : hit.index;
+  }
+
+  for (let index = 0; index < chars.length - 1; index += 1) {
+    const current = chars[index];
+    const next = chars[index + 1];
+    if (x > current.x + current.width && x < next.x) {
+      const middle = (current.x + current.width + next.x) / 2;
+      return x < middle ? current.index + 1 : next.index;
+    }
+  }
+
+  return word.end;
+}
+
+function getNearestTextChar(chars: TextCharBox[], x: number) {
+  if (!chars.length) return null;
+  return chars
+    .map((char) => ({
+      char,
+      distance: Math.abs(x - (char.x + char.width / 2))
+    }))
+    .sort((left, right) => left.distance - right.distance || left.char.index - right.char.index)[0].char;
 }
 
 function buildCustomTextSelection(
@@ -498,25 +1120,34 @@ function buildCustomTextSelection(
 ) {
   if (!model) return null;
   const range = snapTextSelectionRange(model.text, Math.min(startIndex, endIndex), Math.max(startIndex, endIndex));
-  const start = range.start;
-  const end = range.end;
+  const trimmedRange = trimSelectionWhitespace(model.text, range.start, range.end);
+  const start = trimmedRange.start;
+  const end = trimmedRange.end;
   if (end <= start) return null;
 
-  const selectedChars = model.chars.filter((char) => char.index >= start && char.index < end && char.char.trim());
-  if (!selectedChars.length) return null;
+  const selectedChars = model.chars.filter((char) => char.index >= start && char.index < end);
+  const visibleSelectedChars = selectedChars.filter((char) => char.char.trim());
+  if (!visibleSelectedChars.length) return null;
+  const rectSource = visibleSelectedChars;
 
-  const rects = Array.from(new Set(selectedChars.map((char) => char.line))).map((line) => {
-    const lineChars = selectedChars.filter((char) => char.line === line);
-    const left = Math.min(...lineChars.map((char) => char.x));
-    const right = Math.max(...lineChars.map((char) => char.x + char.width));
-    const top = Math.min(...lineChars.map((char) => char.y));
-    const bottom = Math.max(...lineChars.map((char) => char.y + char.height));
-    const verticalPadding = Math.max(2, (bottom - top) * 0.14);
-    const horizontalPadding = Math.max(1, (bottom - top) * 0.04);
+  const rects = Array.from(new Set(rectSource.map((item) => item.line))).map((line) => {
+    const lineItems = rectSource.filter((item) => item.line === line);
+    const wholeLineItems = model.chars.filter((item) => item.line === line && item.char.trim() && item.height > 0);
+    const centerItems = wholeLineItems.length ? wholeLineItems : lineItems;
+    const left = Math.min(...lineItems.map((item) => item.x));
+    const right = Math.max(...lineItems.map((item) => item.x + item.width));
+    const rawTop = Math.min(...lineItems.map((item) => item.y));
+    const rawBottom = Math.max(...lineItems.map((item) => item.y + item.height));
+    const heights = centerItems.map((item) => item.height).filter((height) => Number.isFinite(height) && height > 0);
+    const center = median(centerItems.map((item) => item.y + item.height / 2));
+    const visualHeight = model.source === "pdfium" ? Math.max(4, median(heights) * 1.08) : rawBottom - rawTop;
+    const top = model.source === "pdfium" ? center - visualHeight / 2 : rawTop;
+    const bottom = model.source === "pdfium" ? center + visualHeight / 2 : rawBottom;
+    const verticalPadding = model.source === "pdfium" ? Math.max(1, visualHeight * 0.08) : Math.max(2, (bottom - top) * 0.14);
     return {
-      x: Math.max(0, left - horizontalPadding) / pageSize.width,
+      x: left / pageSize.width,
       y: Math.max(0, top - verticalPadding) / pageSize.height,
-      width: (Math.min(pageSize.width, right + horizontalPadding) - Math.max(0, left - horizontalPadding)) / pageSize.width,
+      width: (right - left) / pageSize.width,
       height: (Math.min(pageSize.height, bottom + verticalPadding) - Math.max(0, top - verticalPadding)) / pageSize.height
     };
   });
@@ -534,33 +1165,38 @@ function buildCustomTextSelection(
   };
 }
 
+function buildPdfiumNativeSelection(result: PdfiumTextSelectionResult, pageSize: { width: number; height: number }) {
+  if (result.empty || !result.text?.trim() || !result.rects?.length) return null;
+  const rects = result.rects.map((rect) => ({
+    x: rect.x / pageSize.width,
+    y: rect.y / pageSize.height,
+    width: rect.width / pageSize.width,
+    height: rect.height / pageSize.height
+  }));
+  const firstRect = rects[0];
+  return {
+    text: result.text.trim(),
+    rects,
+    toolbarPoint: {
+      left: pageSize.width * (firstRect.x + firstRect.width / 2),
+      top: pageSize.height * firstRect.y
+    }
+  };
+}
+
 function snapTextSelectionRange(text: string, rawStart: number, rawEnd: number) {
-  let start = Math.max(0, rawStart);
-  let end = Math.min(text.length, rawEnd);
-  const prefixTrimmed = trimAccidentalLeadingWordTail(text, start, end);
-  start = prefixTrimmed.start;
-  end = prefixTrimmed.end;
-  const selected = text.slice(start, end);
-  const trimmed = selected.trim();
-  const isSingleWordSelection = Boolean(trimmed) && !/[\s\n]/.test(trimmed);
-  if (isSingleWordSelection) return { start, end };
-
-  return { start, end };
+  return {
+    start: Math.max(0, rawStart),
+    end: Math.min(text.length, rawEnd)
+  };
 }
 
-function trimAccidentalLeadingWordTail(text: string, start: number, end: number) {
-  const selected = text.slice(start, end);
-  const match = selected.match(/^([\p{L}\p{N}_-]{1,2})(\s+)([\p{L}\p{N}_-]{2,})(?=$|[^\p{L}\p{N}_-])/u);
-  if (!match) return { start, end };
-  const beforeStart = text[start - 1];
-  if (beforeStart && isTextWordChar(beforeStart)) {
-    return { start: start + match[1].length + match[2].length, end };
-  }
+function trimSelectionWhitespace(text: string, rawStart: number, rawEnd: number) {
+  let start = rawStart;
+  let end = rawEnd;
+  while (start < end && /\s/.test(text[start])) start += 1;
+  while (end > start && /\s/.test(text[end - 1])) end -= 1;
   return { start, end };
-}
-
-function isTextWordChar(char: string | undefined) {
-  return Boolean(char && /[\p{L}\p{N}_-]/u.test(char));
 }
 
 function isSheetVisible(sheet: PaperSheetNote, visiblePages: number[]) {
@@ -583,10 +1219,73 @@ function pageRenderCacheKey(pageNumber: number, scale: number, rotation: number)
   return `${pageNumber}:${scale}:${rotation}`;
 }
 
+function isPdfiumRenderExperimentEnabled() {
+  return window.localStorage.getItem("mutsumi:pdfium-render") === "1";
+}
+
+function isDevMode() {
+  return import.meta.env.DEV;
+}
+
+function logRenderEngine(page: number, engine: "pdfium" | "pdfjs" | "pdfjs-fallback") {
+  if (!isDevMode()) return;
+  console.info(`[Mutsumi] 第${page}页渲染: ${engine}`);
+}
+
 function nextFrame() {
   return new Promise<void>((resolve) => {
     window.setTimeout(resolve, 0);
   });
+}
+
+function canvasToPngData(canvas: HTMLCanvasElement) {
+  return new Promise<ArrayBuffer | null>((resolve) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        resolve(null);
+        return;
+      }
+      blob.arrayBuffer().then(resolve).catch(() => resolve(null));
+    }, "image/png");
+  });
+}
+
+function drawPdfiumBitmap(
+  context: CanvasRenderingContext2D,
+  bitmap: { data: string; width: number; height: number; stride: number; mode: string }
+) {
+  const bytes = base64ToBytes(bitmap.data);
+  const imageData = context.createImageData(bitmap.width, bitmap.height);
+  const channels = bitmap.mode === "BGRA" || bitmap.mode === "RGBA" ? 4 : 3;
+
+  for (let y = 0; y < bitmap.height; y += 1) {
+    for (let x = 0; x < bitmap.width; x += 1) {
+      const source = y * bitmap.stride + x * channels;
+      const target = (y * bitmap.width + x) * 4;
+      if (bitmap.mode === "RGBA") {
+        imageData.data[target] = bytes[source] ?? 255;
+        imageData.data[target + 1] = bytes[source + 1] ?? 255;
+        imageData.data[target + 2] = bytes[source + 2] ?? 255;
+        imageData.data[target + 3] = bytes[source + 3] ?? 255;
+      } else {
+        imageData.data[target] = bytes[source + 2] ?? 255;
+        imageData.data[target + 1] = bytes[source + 1] ?? 255;
+        imageData.data[target + 2] = bytes[source] ?? 255;
+        imageData.data[target + 3] = channels === 4 ? bytes[source + 3] ?? 255 : 255;
+      }
+    }
+  }
+
+  context.putImageData(imageData, 0, 0);
+}
+
+function base64ToBytes(value: string) {
+  const binary = window.atob(value);
+  const bytes = new Uint8ClampedArray(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
 }
 
 function warmPageCanvasCache(
@@ -626,6 +1325,7 @@ function warmPageCanvasCache(
 
 export function App() {
   const [paper, setPaper] = useState<PaperSource | null>(null);
+  const [pdfData, setPdfData] = useState<ArrayBuffer | null>(null);
   const [paperKey, setPaperKey] = useState<string | null>(null);
   const [pdf, setPdf] = useState<PdfDocument | null>(null);
   const [reading, setReading] = useState<ReadingState>(initialReadingState);
@@ -656,6 +1356,7 @@ export function App() {
   const [pendingAnnotationId, setPendingAnnotationId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const currentFileRef = useRef<File | null>(null);
+  const appReadySentRef = useRef(false);
   const noteRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
   const viewMenuRef = useRef<HTMLDivElement | null>(null);
   const pageCanvasCacheRef = useRef<PageCanvasCache>(new Map());
@@ -732,8 +1433,16 @@ export function App() {
   );
 
   useEffect(() => {
-    window.pdfReadingApp?.ready();
-  }, []);
+    if (appReadySentRef.current) return;
+    if (isLoading) return;
+    if (paper && (!pdf || !pdfData)) return;
+
+    const readyTimer = window.setTimeout(() => {
+      appReadySentRef.current = true;
+      window.pdfReadingApp?.ready();
+    }, 0);
+    return () => window.clearTimeout(readyTimer);
+  }, [isLoading, paper, pdf, pdfData]);
 
   useEffect(() => {
     if (!sheetTrayOpen || !activeSheetId) return;
@@ -756,6 +1465,7 @@ export function App() {
     setError(null);
     setIsLoading(true);
     setPdf(null);
+    setPdfData(null);
     setPageSizes({});
     pageCanvasCacheRef.current.clear();
     setTextModelsByPage({});
@@ -787,6 +1497,12 @@ export function App() {
         objectUrl: URL.createObjectURL(file)
       };
     });
+
+    file.arrayBuffer()
+      .then((data) => {
+        if (currentFileRef.current === file) setPdfData(data);
+      })
+      .catch(() => undefined);
   }, [saveDocumentNow]);
 
   useEffect(() => {
@@ -1505,6 +2221,7 @@ export function App() {
         >
           <PdfStage
             pdf={pdf}
+            pdfData={pdfData}
             reading={reading}
             isLoading={isLoading}
             error={error}
@@ -1551,17 +2268,17 @@ export function App() {
             <TextSelectionToolbar
               selection={textSelection}
               onCopy={async () => {
-                await navigator.clipboard?.writeText(repairSelectionText(textSelection, textModelsByPage[textSelection.page]?.lines));
+                await navigator.clipboard?.writeText(textSelection.text);
                 setTextSelection(null);
               }}
               onTranslate={() => {
-                setAssistantDraft(createAssistantDraft("translate", repairSelectionText(textSelection, textModelsByPage[textSelection.page]?.lines), textSelection.page));
+                setAssistantDraft(createAssistantDraft("translate", textSelection.text, textSelection.page));
                 setLeftOpen(true);
                 setLeftPanelView("ai");
                 setTextSelection(null);
               }}
               onAsk={() => {
-                setAssistantDraft(createAssistantDraft("ask", repairSelectionText(textSelection, textModelsByPage[textSelection.page]?.lines), textSelection.page));
+                setAssistantDraft(createAssistantDraft("ask", textSelection.text, textSelection.page));
                 setLeftOpen(true);
                 setLeftPanelView("ai");
                 setTextSelection(null);
@@ -1721,6 +2438,7 @@ function styleLabel(style: AnnotationStyle) {
 
 function PdfStage({
   pdf,
+  pdfData,
   reading,
   isLoading,
   error,
@@ -1747,6 +2465,7 @@ function PdfStage({
   onClearSelection
 }: {
   pdf: PdfDocument | null;
+  pdfData: ArrayBuffer | null;
   reading: ReadingState;
   isLoading: boolean;
   error: string | null;
@@ -1930,6 +2649,7 @@ function PdfStage({
             <PdfPageView
               key={pageNumber}
               pdf={pdf}
+              pdfData={pdfData}
               pageNumber={pageNumber}
               reading={reading}
               initialPageSize={pageSizes[pageNumber]}
@@ -2021,6 +2741,7 @@ function PagePlaceholder({
 
 function PdfPageView({
   pdf,
+  pdfData,
   pageNumber,
   reading,
   initialPageSize,
@@ -2042,6 +2763,7 @@ function PdfPageView({
   onClearSelection
 }: {
   pdf: PdfDocument;
+  pdfData: ArrayBuffer | null;
   pageNumber: number;
   reading: ReadingState;
   initialPageSize: { width: number; height: number } | undefined;
@@ -2067,12 +2789,27 @@ function PdfPageView({
   const [pageSize, setPageSize] = useState(initialPageSize ?? getFallbackPageSize(reading));
   const [draftRect, setDraftRect] = useState<AnnotationRect | null>(null);
   const [textModel, setTextModel] = useState<TextPageModel | null>(null);
+  const [renderEngine, setRenderEngine] = useState<"pdfium" | "pdfjs" | "pdfjs-fallback" | "pending">("pending");
   const [textSelectionDraft, setTextSelectionDraft] = useState<{ start: number; end: number } | null>(null);
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
   const textDragStartRef = useRef<number | null>(null);
   const textDragEndRef = useRef<number | null>(null);
+  const textDragStartPointRef = useRef<{ x: number; y: number } | null>(null);
+  const textSelectionFrameRef = useRef<number | null>(null);
+  const pendingTextSelectionDraftRef = useRef<{ start: number; end: number } | null>(null);
   const scaleRef = useRef(reading.scale);
   const rotationRef = useRef(reading.rotation);
+
+  const updateTextSelectionDraft = useCallback((draft: { start: number; end: number }) => {
+    pendingTextSelectionDraftRef.current = draft;
+    if (textSelectionFrameRef.current !== null) return;
+
+    textSelectionFrameRef.current = requestAnimationFrame(() => {
+      textSelectionFrameRef.current = null;
+      if (!pendingTextSelectionDraftRef.current) return;
+      setTextSelectionDraft(pendingTextSelectionDraftRef.current);
+    });
+  }, []);
 
   useLayoutEffect(() => {
     setPageSize((current) => {
@@ -2088,12 +2825,15 @@ function PdfPageView({
 
   useEffect(() => {
     if (!canvasRef.current || !textLayerRef.current) return;
+    setRenderEngine("pending");
 
     let isCancelled = false;
     let renderTask: pdfjsLib.RenderTask | null = null;
     let textLayer: pdfjsLib.TextLayer | null = null;
     let renderTimer: number | null = null;
-    const key = pageCacheKey(pageNumber, reading);
+    let fallbackTextModel: TextPageModel | null = null;
+    const usePdfiumRender = Boolean(pdfData && window.pdfReadingRender && isPdfiumRenderExperimentEnabled());
+    const key = `${pageCacheKey(pageNumber, reading)}:${usePdfiumRender ? "pdfium" : "pdfjs"}`;
     const cachedCanvas = pageCanvasCache.get(key);
 
     if (cachedCanvas) {
@@ -2107,6 +2847,11 @@ function PdfPageView({
         context.setTransform(1, 0, 0, 1, 0, 0);
         context.clearRect(0, 0, canvas.width, canvas.height);
         context.drawImage(cachedCanvas, 0, 0);
+        const cachedEngine = cachedCanvas.dataset.renderEngine as "pdfium" | "pdfjs" | "pdfjs-fallback" | undefined;
+        if (cachedEngine) {
+          canvas.dataset.renderEngine = cachedEngine;
+          setRenderEngine(cachedEngine);
+        }
       }
     }
 
@@ -2118,6 +2863,7 @@ function PdfPageView({
       const textLayerContainer = textLayerRef.current;
       const context = canvas.getContext("2d");
       if (!context) return;
+      const renderContext = context;
 
       const pixelRatio = window.devicePixelRatio || 1;
       canvas.width = Math.floor(viewport.width * pixelRatio);
@@ -2128,21 +2874,134 @@ function PdfPageView({
       onPageSize(pageNumber, { width: viewport.width, height: viewport.height });
       context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
 
-      renderTask = page.render({ canvasContext: context, viewport });
-      renderTask.promise
-        .then(() => {
-          if (isCancelled) return;
-          const cached = document.createElement("canvas");
-          const cacheContext = cached.getContext("2d");
-          if (!cacheContext) return;
+      const renderWithPdfium = async () => {
+        if (!usePdfiumRender || !pdfData || !window.pdfReadingRender) return false;
+        const renderPixelRatio = window.devicePixelRatio || 1;
+        const result = await window.pdfReadingRender.renderPage({
+          data: pdfData,
+          page: pageNumber,
+          scale: reading.scale * renderPixelRatio,
+          rotation: reading.rotation
+        });
+        if (isCancelled || !isPdfiumRenderResult(result)) return false;
+
+        const cssWidth = result.width / renderPixelRatio;
+        const cssHeight = result.height / renderPixelRatio;
+        canvas.width = Math.floor(result.width);
+        canvas.height = Math.floor(result.height);
+        canvas.style.width = `${cssWidth}px`;
+        canvas.style.height = `${cssHeight}px`;
+        setPageSize({ width: cssWidth, height: cssHeight });
+        onPageSize(pageNumber, { width: cssWidth, height: cssHeight });
+        context.setTransform(1, 0, 0, 1, 0, 0);
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        if (result.bitmap) {
+          drawPdfiumBitmap(context, result.bitmap);
+        } else if (result.image) {
+          const image = new Image();
+          await new Promise<void>((resolve, reject) => {
+            image.onload = () => resolve();
+            image.onerror = () => reject(new Error("PDFium render image failed to load."));
+            image.src = result.image ?? "";
+          });
+          if (isCancelled) return true;
+          context.drawImage(image, 0, 0, result.width, result.height);
+        }
+        canvas.dataset.renderEngine = "pdfium";
+        setRenderEngine("pdfium");
+        logRenderEngine(pageNumber, "pdfium");
+
+        const cached = document.createElement("canvas");
+        const cacheContext = cached.getContext("2d");
+        if (cacheContext) {
           cached.width = canvas.width;
           cached.height = canvas.height;
           cached.style.width = canvas.style.width;
           cached.style.height = canvas.style.height;
+          cached.dataset.renderEngine = "pdfium";
           cacheContext.drawImage(canvas, 0, 0);
           pageCanvasCache.set(key, cached);
-        })
-        .catch(() => undefined);
+        }
+
+        if (isTextPageModel(result.textModel)) {
+          const rawModel = {
+            ...result.textModel,
+            words: result.textModel.words?.length ? result.textModel.words : buildTextWords(result.textModel.text, result.textModel.chars),
+            source: "pdfium" as const
+          };
+          const model = scaleTextPageModel(rawModel, 1 / renderPixelRatio);
+          setTextModel(model);
+          onTextModel(pageNumber, model);
+        }
+        textLayerContainer.replaceChildren();
+        return true;
+      };
+
+      if (usePdfiumRender) {
+        renderWithPdfium()
+          .then((handled) => {
+            if (handled || isCancelled) return;
+            canvas.dataset.renderEngine = "pdfjs-fallback";
+            setRenderEngine("pdfjs-fallback");
+            logRenderEngine(pageNumber, "pdfjs-fallback");
+            renderWithPdfJs();
+          })
+          .catch(() => {
+            if (!isCancelled) {
+              canvas.dataset.renderEngine = "pdfjs-fallback";
+              setRenderEngine("pdfjs-fallback");
+              logRenderEngine(pageNumber, "pdfjs-fallback");
+              renderWithPdfJs();
+            }
+          });
+        return;
+      }
+
+      function renderWithPdfJs() {
+        canvas.dataset.renderEngine = usePdfiumRender ? "pdfjs-fallback" : "pdfjs";
+        setRenderEngine(usePdfiumRender ? "pdfjs-fallback" : "pdfjs");
+        logRenderEngine(pageNumber, usePdfiumRender ? "pdfjs-fallback" : "pdfjs");
+        renderTask = page.render({ canvasContext: renderContext, viewport });
+        renderTask.promise
+          .then(() => {
+            if (isCancelled) return;
+            const cached = document.createElement("canvas");
+            const cacheContext = cached.getContext("2d");
+            if (!cacheContext) return;
+            cached.width = canvas.width;
+            cached.height = canvas.height;
+            cached.style.width = canvas.style.width;
+            cached.style.height = canvas.style.height;
+            cached.dataset.renderEngine = usePdfiumRender ? "pdfjs-fallback" : "pdfjs";
+            cacheContext.drawImage(canvas, 0, 0);
+            pageCanvasCache.set(key, cached);
+
+            if (!fallbackTextModel || !shouldTryOcrFallback(fallbackTextModel) || !window.pdfReadingOcr) return;
+            canvasToPngData(canvas)
+              .then((data) => {
+                if (isCancelled || !data) return null;
+                return window.pdfReadingOcr?.extractPage({
+                  data,
+                  page: pageNumber,
+                  width: viewport.width,
+                  height: viewport.height,
+                  scale: reading.scale,
+                  rotation: reading.rotation
+                });
+              })
+              .then((ocrModel) => {
+                if (isCancelled || !isTextPageModel(ocrModel)) return;
+                const nextModel = {
+                  ...ocrModel,
+                  words: ocrModel.words?.length ? ocrModel.words : buildTextWords(ocrModel.text, ocrModel.chars),
+                  source: "ocr" as const
+                };
+                setTextModel(nextModel);
+                onTextModel(pageNumber, nextModel);
+              })
+              .catch(() => undefined);
+          })
+          .catch(() => undefined);
 
       textLayerContainer.replaceChildren();
       textLayer = new pdfjsLib.TextLayer({
@@ -2154,11 +3013,54 @@ function PdfPageView({
 
       page.getTextContent().then((textContent) => {
         if (!isCancelled) {
-          const model = buildTextPageModel(textContent, viewport);
-          setTextModel(model);
-          onTextModel(pageNumber, model);
+          const fallbackModel = buildTextPageModel(textContent, viewport);
+          fallbackTextModel = fallbackModel;
+
+          if (pdfData && window.pdfReadingText) {
+            window.pdfReadingText
+              .extractPage({
+                data: pdfData,
+                page: pageNumber,
+                scale: reading.scale,
+                rotation: reading.rotation
+              })
+              .then((pdfiumModel) => {
+                if (isCancelled) return;
+                if (!isTextPageModel(pdfiumModel)) {
+                  setTextModel(fallbackModel);
+                  onTextModel(pageNumber, fallbackModel);
+                  return;
+                }
+                const candidateModel = {
+                  ...pdfiumModel,
+                  words: pdfiumModel.words?.length ? pdfiumModel.words : buildTextWords(pdfiumModel.text, pdfiumModel.chars),
+                  source: "pdfium" as const
+                };
+                const alignedModel = alignTextModelYToReference(candidateModel, fallbackModel);
+                const nextModel =
+                  isCompatibleTextModel(alignedModel, fallbackModel) &&
+                  isSpatiallyReliableTextModel(alignedModel, fallbackModel)
+                    ? alignedModel
+                    : null;
+                setTextModel(nextModel ?? fallbackModel);
+                onTextModel(pageNumber, nextModel ?? fallbackModel);
+              })
+              .catch(() => {
+                if (isCancelled) return;
+                setTextModel(fallbackModel);
+                onTextModel(pageNumber, fallbackModel);
+              });
+            return;
+          }
+
+          setTextModel(fallbackModel);
+          onTextModel(pageNumber, fallbackModel);
         }
       }).catch(() => undefined);
+      }
+
+      renderWithPdfJs();
+
     });
 
     const delay = reading.flowMode === "scroll" ? Math.min(Math.abs(pageNumber - reading.currentPage) * 45, 450) : 0;
@@ -2172,7 +3074,11 @@ function PdfPageView({
       renderTask?.cancel();
       textLayer?.cancel();
     };
-  }, [pageCanvasCache, pdf, pageNumber, reading.flowMode, reading.rotation, reading.scale]);
+  }, [pageCanvasCache, pdf, pdfData, pageNumber, reading.flowMode, reading.rotation, reading.scale]);
+
+  useEffect(() => () => {
+    if (textSelectionFrameRef.current !== null) cancelAnimationFrame(textSelectionFrameRef.current);
+  }, []);
 
   const getPoint = (event: React.PointerEvent<HTMLDivElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -2191,10 +3097,25 @@ function PdfPageView({
     height: Math.abs(end.y - start.y) / pageSize.height
   });
 
+  const selectTextWithPdfium = async (start: { x: number; y: number }, end: { x: number; y: number }) => {
+    if (!pdfData || !window.pdfReadingText?.selectText || textModel?.source !== "pdfium") return null;
+    const result = await window.pdfReadingText.selectText({
+      data: pdfData,
+      page: pageNumber,
+      scale: reading.scale,
+      rotation: reading.rotation,
+      start,
+      end
+    });
+    if (!isPdfiumTextSelectionResult(result)) return null;
+    return buildPdfiumNativeSelection(result, pageSize);
+  };
+
   return (
     <div
       className="page-layer"
       data-page-number={pageNumber}
+      data-render-engine={renderEngine}
       style={{ width: pageSize.width, height: pageSize.height, "--text-hit-slop": `${Math.min(0.02 + reading.scale * 0.018, 0.065)}em` } as CSSProperties}
       onPointerDown={(event) => {
         if (!pageSize.width || event.button !== 0) return;
@@ -2226,7 +3147,8 @@ function PdfPageView({
           if (tool.mode !== "select") return;
           event.preventDefault();
           event.stopPropagation();
-          const start = hitTestTextChar(textModel, getPoint(event));
+          const point = getPoint(event);
+          const start = hitTestTextChar(textModel, point, "start");
           if (start === null) {
             onClearTextSelection();
             return;
@@ -2234,32 +3156,51 @@ function PdfPageView({
           event.currentTarget.setPointerCapture(event.pointerId);
           textDragStartRef.current = start;
           textDragEndRef.current = start;
-          setTextSelectionDraft({ start, end: start });
+          textDragStartPointRef.current = point;
+          pendingTextSelectionDraftRef.current = null;
+          setTextSelectionDraft(null);
           onClearTextSelection();
         }}
         onPointerMove={(event) => {
           if (tool.mode !== "select" || textDragStartRef.current === null) return;
           event.preventDefault();
-          const end = hitTestTextChar(textModel, getPoint(event));
+          const point = getPoint(event);
+          const normalEnd = hitTestTextChar(textModel, point);
+          const affinity = normalEnd !== null && normalEnd < textDragStartRef.current ? "backwardEnd" : "forwardEnd";
+          const end = hitTestTextChar(textModel, point, affinity);
           if (end !== null) {
             textDragEndRef.current = end;
-            setTextSelectionDraft({ start: textDragStartRef.current, end });
+            if (Math.abs(end - textDragStartRef.current) > 0) {
+              updateTextSelectionDraft({ start: textDragStartRef.current, end });
+            }
           }
         }}
-        onPointerUp={(event) => {
+        onPointerUp={async (event) => {
           if (tool.mode !== "select" || textDragStartRef.current === null) return;
           event.preventDefault();
           event.stopPropagation();
-          const end = hitTestTextChar(textModel, getPoint(event)) ?? textDragEndRef.current;
-          const selection = end === null ? null : buildCustomTextSelection(textModel, textDragStartRef.current, end, pageSize);
+          const point = getPoint(event);
+          const bounds = event.currentTarget.getBoundingClientRect();
+          const dragStart = textDragStartRef.current;
+          const dragStartPoint = textDragStartPointRef.current;
+          const normalEnd = hitTestTextChar(textModel, point);
+          const affinity = normalEnd !== null && normalEnd < textDragStartRef.current ? "backwardEnd" : "forwardEnd";
+          const end = hitTestTextChar(textModel, point, affinity) ?? textDragEndRef.current;
           textDragStartRef.current = null;
           textDragEndRef.current = null;
+          textDragStartPointRef.current = null;
+          pendingTextSelectionDraftRef.current = null;
+          if (textSelectionFrameRef.current !== null) {
+            cancelAnimationFrame(textSelectionFrameRef.current);
+            textSelectionFrameRef.current = null;
+          }
+          const nativeSelection = dragStartPoint ? await selectTextWithPdfium(dragStartPoint, point).catch(() => null) : null;
+          const selection = nativeSelection ?? (end === null ? null : buildCustomTextSelection(textModel, dragStart, end, pageSize));
           setTextSelectionDraft(null);
           if (!selection) {
             onClearTextSelection();
             return;
           }
-          const bounds = event.currentTarget.getBoundingClientRect();
           onTextSelection({
             text: selection.text,
             page: pageNumber,
@@ -2273,15 +3214,20 @@ function PdfPageView({
       />
       {tool.mode === "select" && textSelectionDraft && (
         <div className="custom-text-selection-layer">
-          {buildCustomTextSelection(textModel, textSelectionDraft.start, textSelectionDraft.end, pageSize)?.rects.map((rect, index) => (
-            <div className="custom-text-selection" key={index} style={rectToStyle(rect, pageSize)} />
+          {buildCustomTextSelection(
+            textModel,
+            textSelectionDraft.start,
+            textSelectionDraft.end,
+            pageSize
+          )?.rects.map((rect, index) => (
+            <div className="custom-text-selection" key={index} style={textSelectionRectToStyle(rect, pageSize)} />
           ))}
         </div>
       )}
       {tool.mode === "select" && !textSelectionDraft && textSelection?.rects?.length ? (
         <div className="custom-text-selection-layer">
           {textSelection.rects.map((rect, index) => (
-            <div className="custom-text-selection settled" key={index} style={rectToStyle(rect, pageSize)} />
+            <div className="custom-text-selection settled" key={index} style={textSelectionRectToStyle(rect, pageSize)} />
           ))}
         </div>
       ) : null}
@@ -2848,6 +3794,21 @@ function rectToStyle(rect: AnnotationRect, pageSize: { width: number; height: nu
     top: rect.y * pageSize.height,
     width: rect.width * pageSize.width,
     height: rect.height * pageSize.height
+  };
+}
+
+function textSelectionRectToStyle(rect: AnnotationRect, pageSize: { width: number; height: number }) {
+  const top = rect.y * pageSize.height;
+  const height = rect.height * pageSize.height;
+  const center = top + height / 2;
+  const targetHeight = Math.max(height * 1.18, 22);
+  const visualTop = Math.max(0, center - targetHeight / 2);
+  const visualBottom = Math.min(pageSize.height, center + targetHeight / 2);
+  return {
+    left: rect.x * pageSize.width,
+    top: visualTop,
+    width: rect.width * pageSize.width,
+    height: visualBottom - visualTop
   };
 }
 

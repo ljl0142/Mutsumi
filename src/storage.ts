@@ -14,6 +14,43 @@ type DesktopTranslatorBridge = {
   translate: (request: { text: string; sourceLanguage: string; targetLanguage: string }) => Promise<string>;
 };
 
+type DesktopTextBridge = {
+  extractPage: (request: {
+    data: ArrayBuffer;
+    page: number;
+    scale: number;
+    rotation: number;
+  }) => Promise<unknown>;
+  selectText: (request: {
+    data: ArrayBuffer;
+    page: number;
+    scale: number;
+    rotation: number;
+    start: { x: number; y: number };
+    end: { x: number; y: number };
+  }) => Promise<unknown>;
+};
+
+type DesktopRenderBridge = {
+  renderPage: (request: {
+    data: ArrayBuffer;
+    page: number;
+    scale: number;
+    rotation: number;
+  }) => Promise<unknown>;
+};
+
+type DesktopOcrBridge = {
+  extractPage: (request: {
+    data: ArrayBuffer;
+    page: number;
+    width: number;
+    height: number;
+    scale: number;
+    rotation: number;
+  }) => Promise<unknown>;
+};
+
 type DesktopFileBridge = {
   savePdf: (request: { defaultName: string; data: ArrayBuffer }) => Promise<{ canceled: boolean; filePath?: string }>;
 };
@@ -26,6 +63,9 @@ declare global {
   interface Window {
     pdfReadingStorage?: DesktopStorageBridge;
     pdfReadingTranslator?: DesktopTranslatorBridge;
+    pdfReadingText?: DesktopTextBridge;
+    pdfReadingRender?: DesktopRenderBridge;
+    pdfReadingOcr?: DesktopOcrBridge;
     pdfReadingFile?: DesktopFileBridge;
     pdfReadingApp?: DesktopAppBridge;
   }

@@ -1,11 +1,14 @@
 ﻿const fs = require("node:fs");
 const path = require("node:path");
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
-const { translateLocally } = require("./localTranslator.cjs");
+const { extractPageTextWithPdfium, renderPageWithPdfium, selectTextWithPdfium } = require("./pdfiumText.cjs");
 
 const isDev = process.env.NODE_ENV === "development" || process.env.ELECTRON_START_URL;
 const devUrl = process.env.ELECTRON_START_URL || "http://127.0.0.1:5173";
 const customUserDataDir = process.env.PDF_READING_USER_DATA_DIR;
+const splashByWebContentsId = new Map();
+let localTranslatorModule = null;
+let ocrTextModule = null;
 
 app.setName("Mutsumi");
 Menu.setApplicationMenu(null);
@@ -67,6 +70,20 @@ function iconDataUrl() {
   } catch {
     return "";
   }
+}
+
+function translateLocally(request) {
+  if (!localTranslatorModule) {
+    localTranslatorModule = require("./localTranslator.cjs");
+  }
+  return localTranslatorModule.translateLocally(request);
+}
+
+function extractPageTextWithOcr(request) {
+  if (!ocrTextModule) {
+    ocrTextModule = require("./ocrText.cjs");
+  }
+  return ocrTextModule.extractPageTextWithOcr(request);
 }
 
 function createSplashWindow() {
@@ -207,18 +224,35 @@ function createWindow() {
     return { action: "deny" };
   });
 
-  const showWindow = () => {
-    if (win.isDestroyed() || win.isVisible()) return;
-    win.show();
-    if (!splash.isDestroyed()) splash.close();
-  };
+  if (isDev) {
+    win.webContents.on("before-input-event", (event, input) => {
+      const opensDevTools = input.type === "keyDown" && input.key.toLowerCase() === "i" && input.control && input.shift;
+      if (!opensDevTools) return;
+      event.preventDefault();
+      if (win.webContents.isDevToolsOpened()) {
+        win.webContents.closeDevTools();
+      } else {
+        win.webContents.openDevTools({ mode: "detach" });
+      }
+    });
+  }
 
-  const fallbackTimer = setTimeout(showWindow, 5000);
-  win.on("closed", () => {
-    clearTimeout(fallbackTimer);
+  const showWindow = () => {
+    if (win.isDestroyed()) return;
+    if (!win.isVisible()) win.show();
     if (!splash.isDestroyed()) splash.close();
+    splashByWebContentsId.delete(winContentsId);
+  };
+  const winContentsId = win.webContents.id;
+  splashByWebContentsId.set(winContentsId, splash);
+
+  win.on("closed", () => {
+    if (!splash.isDestroyed()) splash.close();
+    splashByWebContentsId.delete(winContentsId);
   });
-  win.once("ready-to-show", showWindow);
+  win.webContents.on("did-fail-load", (_event, _errorCode, errorDescription) => {
+    console.error(`Mutsumi failed to load renderer: ${errorDescription}`);
+  });
   win.webContents.once("dom-ready", showWindow);
 
   if (isDev) {
@@ -248,9 +282,45 @@ ipcMain.on("storage:save-assistant-settings", (event, settings) => {
 
 ipcMain.handle("translator:translate", (_event, request) => translateLocally(request));
 
+ipcMain.handle("pdfium-text:extract-page", async (_event, request) => {
+  try {
+    return await extractPageTextWithPdfium(request);
+  } catch {
+    return null;
+  }
+});
+
+ipcMain.handle("ocr-text:extract-page", async (_event, request) => {
+  try {
+    return await extractPageTextWithOcr(request);
+  } catch {
+    return null;
+  }
+});
+
+ipcMain.handle("pdfium-render:render-page", async (_event, request) => {
+  try {
+    return await renderPageWithPdfium(request);
+  } catch {
+    return null;
+  }
+});
+
+ipcMain.handle("pdfium-text:select", async (_event, request) => {
+  try {
+    return await selectTextWithPdfium(request);
+  } catch {
+    return null;
+  }
+});
+
 ipcMain.on("app:renderer-ready", (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
-  if (win && !win.isDestroyed()) win.show();
+  if (!win || win.isDestroyed()) return;
+  if (!win.isVisible()) win.show();
+  const splash = splashByWebContentsId.get(event.sender.id);
+  if (splash && !splash.isDestroyed()) splash.close();
+  splashByWebContentsId.delete(event.sender.id);
 });
 
 ipcMain.handle("file:save-pdf", async (_event, request) => {

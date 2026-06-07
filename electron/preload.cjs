@@ -21,6 +21,27 @@ contextBridge.exposeInMainWorld("pdfReadingTranslator", {
   }
 });
 
+contextBridge.exposeInMainWorld("pdfReadingText", {
+  extractPage(request) {
+    return ipcRenderer.invoke("pdfium-text:extract-page", request);
+  },
+  selectText(request) {
+    return ipcRenderer.invoke("pdfium-text:select", request);
+  }
+});
+
+contextBridge.exposeInMainWorld("pdfReadingRender", {
+  renderPage(request) {
+    return ipcRenderer.invoke("pdfium-render:render-page", request);
+  }
+});
+
+contextBridge.exposeInMainWorld("pdfReadingOcr", {
+  extractPage(request) {
+    return ipcRenderer.invoke("ocr-text:extract-page", request);
+  }
+});
+
 contextBridge.exposeInMainWorld("pdfReadingFile", {
   savePdf(request) {
     return ipcRenderer.invoke("file:save-pdf", request);
