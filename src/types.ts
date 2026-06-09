@@ -59,12 +59,12 @@ export type PaperSheetNote = {
   updatedAt: string;
 };
 
-export type CloudProvider = "gpt" | "gemini" | "deepseek";
+export type CloudProvider = "gpt" | "gemini" | "deepseek" | "qwen";
 
 export type AssistantSettings = {
   providerMode: "auto" | "local" | "cloud";
   cloudProvider: CloudProvider;
-  apiKey: string;
+  apiKeys: Record<CloudProvider, string>;
   sourceLanguage: string;
   targetLanguage: string;
 };

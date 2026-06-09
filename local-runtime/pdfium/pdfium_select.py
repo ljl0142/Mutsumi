@@ -117,12 +117,6 @@ def main():
         "start": start,
         "end": end,
         "rects": rects,
-        "debug": {
-            "range": f"pdfium-native {start}-{end}",
-            "chars": text[:160],
-            "startRaw": start_raw,
-            "endRaw": end_raw,
-        },
     }, ensure_ascii=False))
 
 

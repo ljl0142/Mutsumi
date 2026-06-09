@@ -13,7 +13,7 @@
     "electron": "electron electron/main.cjs",
     "desktop": "npm run build && electron electron/main.cjs",
     "preview": "vite preview --host 127.0.0.1",
-    "pack": "npm run build && set ELECTRON_BUILDER_CACHE=.builder-cache&& electron-builder --dir",
+    "pack": "npm run build && set ELECTRON_BUILDER_CACHE=.builder-cache&& electron-builder --dir && node electron/applyIcon.cjs",
     "dist": "npm run build && set ELECTRON_BUILDER_CACHE=.builder-cache&& electron-builder"
   },
   "build": {
@@ -26,11 +26,19 @@
     "files": [
       "dist/**/*",
       "electron/**/*",
-      "local-runtime/**/*",
+      "build/**/*",
       "package.json"
     ],
-    "asarUnpack": [
-      "local-runtime/**/*"
+    "extraResources": [
+      {
+        "from": "local-runtime",
+        "to": "local-runtime",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc"
+        ]
+      }
     ],
     "win": {
       "icon": "build/icon.ico",

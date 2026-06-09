@@ -1,7 +1,6 @@
 ﻿import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, TextareaHTMLAttributes } from "react";
 import {
-  BookOpen,
   Bot,
   ChevronLeft,
   ChevronRight,
@@ -20,12 +19,14 @@ import {
   RotateCw,
   Search,
   Settings2,
+  SlidersHorizontal,
   Trash2,
   Underline,
   X,
   ZoomIn,
   ZoomOut
 } from "lucide-react";
+import appIconUrl from "../build/icon.png";
 import { pdfjsLib } from "./pdfWorker";
 import { defaultAssistantSettings, getPaperKey, storage } from "./storage";
 import type {
@@ -72,6 +73,9 @@ type TextSelectionState = {
   position: { left: number; top: number };
   rects?: AnnotationRect[];
 };
+
+type AppTheme = "default";
+type AppLanguage = "zh";
 
 type TextLine = {
   text: string;
@@ -218,24 +222,18 @@ function getAppMetrics() {
   };
 }
 
-const cloudProviderPresets: Record<CloudProvider, { label: string; baseUrl: string; model: string; envKey: string }> = {
+const cloudProviderPresets: Record<CloudProvider, { label: string }> = {
   gpt: {
-    label: "GPT",
-    baseUrl: "https://api.openai.com/v1",
-    model: "gpt-4.1-mini",
-    envKey: "VITE_OPENAI_API_KEY"
+    label: "GPT"
   },
   gemini: {
-    label: "Gemini",
-    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
-    model: "gemini-2.5-flash",
-    envKey: "VITE_GEMINI_API_KEY"
+    label: "Gemini"
   },
   deepseek: {
-    label: "DeepSeek",
-    baseUrl: "https://api.deepseek.com",
-    model: "deepseek-chat",
-    envKey: "VITE_DEEPSEEK_API_KEY"
+    label: "DeepSeek"
+  },
+  qwen: {
+    label: "Qwen"
   }
 };
 
@@ -252,10 +250,9 @@ function createAssistantDraft(mode: AssistantDraft["mode"], text: string, page: 
   };
 }
 
-function getProviderApiKey(settings: AssistantSettings) {
-  const preset = cloudProviderPresets[settings.cloudProvider];
-  const env = import.meta.env as Record<string, string | undefined>;
-  return settings.apiKey.trim() || env[preset.envKey]?.trim() || "";
+function getUserFacingErrorMessage(errorValue: unknown) {
+  const rawMessage = errorValue instanceof Error ? errorValue.message : String(errorValue || "处理失败。");
+  return rawMessage.replace(/^Error invoking remote method '[^']+': Error:\s*/u, "").trim() || "处理失败。";
 }
 
 function getBrowserTranslator() {
@@ -281,57 +278,16 @@ async function runLocalTranslation(text: string, sourceLanguage: string, targetL
   }
 }
 
-function getChatCompletionText(payload: unknown): string {
-  if (typeof payload !== "object" || payload === null) return "";
-  const choices = (payload as { choices?: unknown }).choices;
-  if (!Array.isArray(choices)) return "";
-  const first = choices[0];
-  if (typeof first !== "object" || first === null) return "";
-  const message = (first as { message?: unknown }).message;
-  if (typeof message !== "object" || message === null) return "";
-  const content = (message as { content?: unknown }).content;
-  return typeof content === "string" ? content.trim() : "";
-}
-
 async function runCloudAssistant(draft: AssistantDraft, settings: AssistantSettings) {
-  const preset = cloudProviderPresets[settings.cloudProvider];
-  const apiKey = getProviderApiKey(settings);
-  if (!apiKey) throw new Error(`${preset.label} 还没有配置密钥。`);
-  const baseUrl = preset.baseUrl.replace(/\/+$/, "");
-
-  const system =
-    draft.mode === "translate"
-      ? `You translate academic writing into clear ${settings.targetLanguage === "zh" ? "Simplified Chinese" : settings.targetLanguage}. Keep technical terms accurate and preserve equations, citations, and variable names.`
-      : "You help read academic papers. Answer based only on the selected passage. If the passage is insufficient, say what is missing.";
-  const user =
-    draft.mode === "translate"
-      ? draft.text
-      : `Selected passage from page ${draft.page}:\n${draft.text}\n\nQuestion:\n${draft.question.trim()}`;
-
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model: preset.model,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user }
-      ],
-      temperature: 0.2
-    })
+  if (!window.pdfReadingAssistant) throw new Error("当前环境没有可用的云端模型通道。");
+  return window.pdfReadingAssistant.run({
+    mode: draft.mode,
+    provider: settings.cloudProvider,
+    text: draft.text,
+    page: draft.page,
+    question: draft.question,
+    targetLanguage: settings.targetLanguage
   });
-
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(detail || `云端请求失败：${response.status}`);
-  }
-
-  const text = getChatCompletionText(await response.json());
-  if (!text) throw new Error("云端返回为空。");
-  return text;
 }
 
 function getVisibleSheetPages(reading: ReadingState) {
@@ -1130,7 +1086,7 @@ function buildCustomTextSelection(
   if (!visibleSelectedChars.length) return null;
   const rectSource = visibleSelectedChars;
 
-  const rects = Array.from(new Set(rectSource.map((item) => item.line))).map((line) => {
+  const rawRects = Array.from(new Set(rectSource.map((item) => item.line))).map((line) => {
     const lineItems = rectSource.filter((item) => item.line === line);
     const wholeLineItems = model.chars.filter((item) => item.line === line && item.char.trim() && item.height > 0);
     const centerItems = wholeLineItems.length ? wholeLineItems : lineItems;
@@ -1151,6 +1107,7 @@ function buildCustomTextSelection(
       height: (Math.min(pageSize.height, bottom + verticalPadding) - Math.max(0, top - verticalPadding)) / pageSize.height
     };
   });
+  const rects = tightenNormalizedSelectionRects(rawRects, pageSize);
 
   const firstRect = rects[0];
   const text = model.text.slice(start, end).replace(/\s+\n/g, "\n").trim();
@@ -1167,12 +1124,13 @@ function buildCustomTextSelection(
 
 function buildPdfiumNativeSelection(result: PdfiumTextSelectionResult, pageSize: { width: number; height: number }) {
   if (result.empty || !result.text?.trim() || !result.rects?.length) return null;
-  const rects = result.rects.map((rect) => ({
+  const rawRects = result.rects.map((rect) => ({
     x: rect.x / pageSize.width,
     y: rect.y / pageSize.height,
     width: rect.width / pageSize.width,
     height: rect.height / pageSize.height
   }));
+  const rects = tightenNormalizedSelectionRects(rawRects, pageSize);
   const firstRect = rects[0];
   return {
     text: result.text.trim(),
@@ -1182,6 +1140,27 @@ function buildPdfiumNativeSelection(result: PdfiumTextSelectionResult, pageSize:
       top: pageSize.height * firstRect.y
     }
   };
+}
+
+function tightenNormalizedSelectionRects(rects: AnnotationRect[], pageSize: { width: number; height: number }) {
+  if (rects.length <= 1) return rects;
+  const validHeights = rects
+    .map((rect) => rect.height * pageSize.height)
+    .filter((height) => Number.isFinite(height) && height > 0);
+  const medianHeight = median(validHeights);
+  if (!medianHeight) return rects;
+
+  return rects.map((rect) => {
+    const rawHeight = rect.height * pageSize.height;
+    const targetHeight = Math.max(4, Math.min(rawHeight, medianHeight * 0.86));
+    const targetHeightRatio = targetHeight / pageSize.height;
+    const center = rect.y + rect.height / 2;
+    return {
+      ...rect,
+      y: center - targetHeightRatio / 2,
+      height: targetHeightRatio
+    };
+  });
 }
 
 function snapTextSelectionRange(text: string, rawStart: number, rawEnd: number) {
@@ -1211,16 +1190,12 @@ function sheetPageLabel(sheet: PaperSheetNote) {
   return `第 ${sheet.page} 页`;
 }
 
-function pageCacheKey(pageNumber: number, reading: ReadingState) {
-  return `${pageNumber}:${reading.scale}:${reading.rotation}`;
+function pageRenderCacheKey(pageNumber: number, scale: number, rotation: number, pixelRatio = window.devicePixelRatio || 1) {
+  return `${pageNumber}:${scale}:${rotation}:${Math.round(pixelRatio * 100)}`;
 }
 
-function pageRenderCacheKey(pageNumber: number, scale: number, rotation: number) {
-  return `${pageNumber}:${scale}:${rotation}`;
-}
-
-function isPdfiumRenderExperimentEnabled() {
-  return window.localStorage.getItem("mutsumi:pdfium-render") === "1";
+function isPdfiumRenderEnabled() {
+  return Boolean(window.pdfReadingRender);
 }
 
 function isDevMode() {
@@ -1293,17 +1268,17 @@ function warmPageCanvasCache(
   pageNumber: number,
   scale: number,
   rotation: number,
+  pixelRatio: number,
   pageCanvasCache: PageCanvasCache,
   isCancelled: () => boolean
 ) {
-  const key = pageRenderCacheKey(pageNumber, scale, rotation);
+  const key = pageRenderCacheKey(pageNumber, scale, rotation, pixelRatio);
   if (pageCanvasCache.has(key)) return;
 
   pdf.getPage(pageNumber)
     .then((page) => {
       if (isCancelled() || pageCanvasCache.has(key)) return;
       const viewport = page.getViewport({ scale, rotation });
-      const pixelRatio = window.devicePixelRatio || 1;
       const canvas = document.createElement("canvas");
       const context = canvas.getContext("2d");
       if (!context) return;
@@ -1343,6 +1318,7 @@ export function App() {
   const [searchPages, setSearchPages] = useState<SearchPage[]>([]);
   const [isSearchIndexing, setIsSearchIndexing] = useState(false);
   const [viewPanelOpen, setViewPanelOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [tool, setTool] = useState<AnnotationTool>(defaultTool);
   const [annotations, setAnnotations] = useState<PaperAnnotation[]>([]);
   const [sheetNotes, setSheetNotes] = useState<PaperSheetNote[]>([]);
@@ -1520,18 +1496,17 @@ export function App() {
         setPdf(document);
         setReading((state) => {
           const restored = savedReading;
-          const currentPage = Math.min(Math.max(restored?.currentPage ?? 1, 1), document.numPages);
           return {
             ...state,
-            currentPage,
+            currentPage: 1,
             pageCount: document.numPages,
-            scale: restored?.scale ?? state.scale,
-            rotation: restored?.rotation ?? state.rotation,
+            scale: state.scale,
+            rotation: state.rotation,
             spreadMode: restored?.spreadMode ?? state.spreadMode,
             flowMode: restored?.flowMode ?? state.flowMode
           };
         });
-        setActivePage(Math.min(Math.max(savedReading?.currentPage ?? 1, 1), document.numPages));
+        setActivePage(1);
       })
       .catch(() => {
         if (!isCancelled) setError("PDF 加载失败，请换一个文件试试。");
@@ -1702,8 +1677,8 @@ export function App() {
       }
     };
 
-    window.addEventListener("pointerdown", handlePointerDown);
-    return () => window.removeEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    return () => document.removeEventListener("pointerdown", handlePointerDown, true);
   }, [viewPanelOpen]);
 
   const pageStep = reading.spreadMode === "double" ? 2 : 1;
@@ -1735,15 +1710,6 @@ export function App() {
     zoomAnchorRef.current = null;
     setReading((state) => {
       const nextScale = Math.min(2.5, Math.max(0.5, Number((state.scale + delta).toFixed(2))));
-      const ratio = nextScale / state.scale;
-      setPageSizes((sizes) =>
-        Object.fromEntries(
-          Object.entries(sizes).map(([page, size]) => [
-            page,
-            { width: size.width * ratio, height: size.height * ratio }
-          ])
-        )
-      );
       return {
         ...state,
         scale: nextScale,
@@ -1859,21 +1825,8 @@ export function App() {
       return;
     }
 
-    const canUseCloud = assistantSettings.providerMode !== "local" && getProviderApiKey(assistantSettings).length > 0;
-    const selectedProvider = cloudProviderPresets[assistantSettings.cloudProvider];
-    if (assistantSettings.providerMode === "cloud" && !canUseCloud) {
-      setAssistantDraft({
-        ...assistantDraft,
-        status: "error",
-        error: `${selectedProvider.label} 模型不可用：还没有配置密钥。`,
-        result: "",
-        provider: "cloud"
-      });
-      return;
-    }
-
     const provider: AssistantDraft["provider"] =
-      assistantSettings.providerMode === "local" || !canUseCloud ? "local" : "cloud";
+      assistantDraft.mode === "ask" || assistantSettings.providerMode !== "local" ? "cloud" : "local";
     const shouldShowLocalTranslationNotice =
       provider === "local" && assistantDraft.mode === "translate" && !hasShownLocalTranslationNoticeRef.current;
     if (shouldShowLocalTranslationNotice) hasShownLocalTranslationNoticeRef.current = true;
@@ -1896,13 +1849,13 @@ export function App() {
                 assistantSettings.sourceLanguage,
                 assistantSettings.targetLanguage
               )
-            : await Promise.reject(new Error("提问需要配置云端模型，本地模式暂不支持问答。"));
+            : await Promise.reject(new Error("提问需要选择可用的云端模型。"));
 
       setAssistantDraft((current) =>
         current ? { ...current, status: "done", result, error: "", provider, notice: "" } : current
       );
     } catch (errorValue) {
-      const message = errorValue instanceof Error ? errorValue.message : "处理失败。";
+      const message = getUserFacingErrorMessage(errorValue);
       if (assistantSettings.providerMode === "auto" && provider === "cloud" && assistantDraft.mode === "translate") {
         try {
           const shouldShowFallbackNotice = !hasShownLocalTranslationNoticeRef.current;
@@ -2007,6 +1960,7 @@ export function App() {
     link.click();
     URL.revokeObjectURL(url);
   };
+  const canvasPixelRatio = window.pdfReadingStorage ? Math.min(3, (window.devicePixelRatio || 1) / 0.68) : window.devicePixelRatio || 1;
 
   return (
     <main
@@ -2027,11 +1981,14 @@ export function App() {
     >
       <header className="top-bar">
         <div className="brand-block">
-          <BookOpen size={20} />
+          <img className="brand-icon" src={appIconUrl} alt="" />
           <div>
             <strong>Mutsumi</strong>
             <span>{paper ? paper.name : "本地 PDF 阅读工作台"}</span>
           </div>
+          <button className="brand-open-button" title="设置" onClick={() => setSettingsOpen(true)}>
+            <SlidersHorizontal size={17} />
+          </button>
           <button className="brand-open-button" title="Open PDF" onClick={() => fileInputRef.current?.click()}>
             <FolderOpen size={17} />
           </button>
@@ -2223,6 +2180,7 @@ export function App() {
             pdf={pdf}
             pdfData={pdfData}
             reading={reading}
+            canvasPixelRatio={canvasPixelRatio}
             isLoading={isLoading}
             error={error}
             tool={tool}
@@ -2375,6 +2333,13 @@ export function App() {
           )}
         </aside>
       </section>
+      {settingsOpen && (
+        <SettingsDialog
+          settings={assistantSettings}
+          onClose={() => setSettingsOpen(false)}
+          onSettingsChange={setAssistantSettings}
+        />
+      )}
     </main>
   );
 }
@@ -2440,6 +2405,7 @@ function PdfStage({
   pdf,
   pdfData,
   reading,
+  canvasPixelRatio,
   isLoading,
   error,
   tool,
@@ -2467,6 +2433,7 @@ function PdfStage({
   pdf: PdfDocument | null;
   pdfData: ArrayBuffer | null;
   reading: ReadingState;
+  canvasPixelRatio: number;
   isLoading: boolean;
   error: string | null;
   tool: AnnotationTool;
@@ -2517,29 +2484,33 @@ function PdfStage({
     ).filter((page) => page >= 1 && page <= reading.pageCount);
 
     preloadPages.forEach((pageNumber) => {
-      const key = pageCacheKey(pageNumber, reading);
+      const key = pageRenderCacheKey(pageNumber, reading.scale, reading.rotation, canvasPixelRatio);
       if (pageCanvasCache.has(key)) return;
 
-      warmPageCanvasCache(pdf, pageNumber, reading.scale, reading.rotation, pageCanvasCache, () => isCancelled);
+      warmPageCanvasCache(pdf, pageNumber, reading.scale, reading.rotation, canvasPixelRatio, pageCanvasCache, () => isCancelled);
     });
 
     return () => {
       isCancelled = true;
     };
-  }, [pageCanvasCache, pdf, reading.currentPage, reading.flowMode, reading.pageCount, reading.rotation, reading.scale, reading.spreadMode]);
+  }, [canvasPixelRatio, pageCanvasCache, pdf, reading.currentPage, reading.flowMode, reading.pageCount, reading.rotation, reading.scale, reading.spreadMode]);
 
   useEffect(() => {
     if (!pdf || reading.flowMode !== "paged") return;
 
     let isCancelled = false;
     const timeoutId = window.setTimeout(() => {
-      const warmScales = [-0.4, -0.3, -0.2, -0.1, 0.1, 0.2]
+      const warmScales = [-0.1, 0.1]
         .map((delta) => Math.min(2.5, Math.max(0.5, Number((reading.scale + delta).toFixed(2)))))
         .filter((scale, index, items) => scale !== reading.scale && items.indexOf(scale) === index);
+      const warmRotations = [reading.rotation, (reading.rotation + 90) % 360];
 
       getVisiblePages(reading).forEach((pageNumber) => {
-        warmScales.forEach((scale) => {
-          warmPageCanvasCache(pdf, pageNumber, scale, reading.rotation, pageCanvasCache, () => isCancelled);
+        warmRotations.forEach((rotation) => {
+          warmPageCanvasCache(pdf, pageNumber, reading.scale, rotation, canvasPixelRatio, pageCanvasCache, () => isCancelled);
+          warmScales.forEach((scale) => {
+            warmPageCanvasCache(pdf, pageNumber, scale, rotation, canvasPixelRatio, pageCanvasCache, () => isCancelled);
+          });
         });
       });
     }, 260);
@@ -2548,7 +2519,7 @@ function PdfStage({
       isCancelled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [pageCanvasCache, pdf, reading.currentPage, reading.flowMode, reading.rotation, reading.scale, reading.spreadMode]);
+  }, [canvasPixelRatio, pageCanvasCache, pdf, reading.currentPage, reading.flowMode, reading.rotation, reading.scale, reading.spreadMode]);
 
   useLayoutEffect(() => {
     if (!pdf || reading.flowMode !== "scroll") return;
@@ -2652,6 +2623,7 @@ function PdfStage({
               pdfData={pdfData}
               pageNumber={pageNumber}
               reading={reading}
+              canvasPixelRatio={canvasPixelRatio}
               initialPageSize={pageSizes[pageNumber]}
               pageCanvasCache={pageCanvasCache}
               tool={tool}
@@ -2744,6 +2716,7 @@ function PdfPageView({
   pdfData,
   pageNumber,
   reading,
+  canvasPixelRatio,
   initialPageSize,
   pageCanvasCache,
   tool,
@@ -2766,6 +2739,7 @@ function PdfPageView({
   pdfData: ArrayBuffer | null;
   pageNumber: number;
   reading: ReadingState;
+  canvasPixelRatio: number;
   initialPageSize: { width: number; height: number } | undefined;
   pageCanvasCache: PageCanvasCache;
   tool: AnnotationTool;
@@ -2799,6 +2773,7 @@ function PdfPageView({
   const pendingTextSelectionDraftRef = useRef<{ start: number; end: number } | null>(null);
   const scaleRef = useRef(reading.scale);
   const rotationRef = useRef(reading.rotation);
+  const usePdfiumRender = Boolean(pdfData && isPdfiumRenderEnabled());
 
   const updateTextSelectionDraft = useCallback((draft: { start: number; end: number }) => {
     pendingTextSelectionDraftRef.current = draft;
@@ -2825,15 +2800,14 @@ function PdfPageView({
 
   useEffect(() => {
     if (!canvasRef.current || !textLayerRef.current) return;
-    setRenderEngine("pending");
+    if (!canvasRef.current.width || !canvasRef.current.height) setRenderEngine("pending");
 
     let isCancelled = false;
     let renderTask: pdfjsLib.RenderTask | null = null;
     let textLayer: pdfjsLib.TextLayer | null = null;
     let renderTimer: number | null = null;
     let fallbackTextModel: TextPageModel | null = null;
-    const usePdfiumRender = Boolean(pdfData && window.pdfReadingRender && isPdfiumRenderExperimentEnabled());
-    const key = `${pageCacheKey(pageNumber, reading)}:${usePdfiumRender ? "pdfium" : "pdfjs"}`;
+    const key = `${pageRenderCacheKey(pageNumber, reading.scale, reading.rotation, canvasPixelRatio)}:${usePdfiumRender ? "pdfium" : "pdfjs"}`;
     const cachedCanvas = pageCanvasCache.get(key);
 
     if (cachedCanvas) {
@@ -2844,6 +2818,12 @@ function PdfPageView({
         canvas.height = cachedCanvas.height;
         canvas.style.width = cachedCanvas.style.width;
         canvas.style.height = cachedCanvas.style.height;
+        const cachedWidth = Number.parseFloat(cachedCanvas.style.width);
+        const cachedHeight = Number.parseFloat(cachedCanvas.style.height);
+        if (Number.isFinite(cachedWidth) && Number.isFinite(cachedHeight)) {
+          setPageSize({ width: cachedWidth, height: cachedHeight });
+          onPageSize(pageNumber, { width: cachedWidth, height: cachedHeight });
+        }
         context.setTransform(1, 0, 0, 1, 0, 0);
         context.clearRect(0, 0, canvas.width, canvas.height);
         context.drawImage(cachedCanvas, 0, 0);
@@ -2865,18 +2845,11 @@ function PdfPageView({
       if (!context) return;
       const renderContext = context;
 
-      const pixelRatio = window.devicePixelRatio || 1;
-      canvas.width = Math.floor(viewport.width * pixelRatio);
-      canvas.height = Math.floor(viewport.height * pixelRatio);
-      canvas.style.width = `${viewport.width}px`;
-      canvas.style.height = `${viewport.height}px`;
-      setPageSize({ width: viewport.width, height: viewport.height });
-      onPageSize(pageNumber, { width: viewport.width, height: viewport.height });
-      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      const pixelRatio = canvasPixelRatio;
 
       const renderWithPdfium = async () => {
         if (!usePdfiumRender || !pdfData || !window.pdfReadingRender) return false;
-        const renderPixelRatio = window.devicePixelRatio || 1;
+        const renderPixelRatio = canvasPixelRatio;
         const result = await window.pdfReadingRender.renderPage({
           data: pdfData,
           page: pageNumber,
@@ -2887,16 +2860,15 @@ function PdfPageView({
 
         const cssWidth = result.width / renderPixelRatio;
         const cssHeight = result.height / renderPixelRatio;
-        canvas.width = Math.floor(result.width);
-        canvas.height = Math.floor(result.height);
-        canvas.style.width = `${cssWidth}px`;
-        canvas.style.height = `${cssHeight}px`;
-        setPageSize({ width: cssWidth, height: cssHeight });
-        onPageSize(pageNumber, { width: cssWidth, height: cssHeight });
-        context.setTransform(1, 0, 0, 1, 0, 0);
-        context.clearRect(0, 0, canvas.width, canvas.height);
+        const nextCanvas = document.createElement("canvas");
+        const nextContext = nextCanvas.getContext("2d");
+        if (!nextContext) return false;
+        nextCanvas.width = Math.floor(result.width);
+        nextCanvas.height = Math.floor(result.height);
+        nextCanvas.style.width = `${cssWidth}px`;
+        nextCanvas.style.height = `${cssHeight}px`;
         if (result.bitmap) {
-          drawPdfiumBitmap(context, result.bitmap);
+          drawPdfiumBitmap(nextContext, result.bitmap);
         } else if (result.image) {
           const image = new Image();
           await new Promise<void>((resolve, reject) => {
@@ -2905,23 +2877,24 @@ function PdfPageView({
             image.src = result.image ?? "";
           });
           if (isCancelled) return true;
-          context.drawImage(image, 0, 0, result.width, result.height);
+          nextContext.drawImage(image, 0, 0, result.width, result.height);
         }
+        if (isCancelled) return true;
+
+        canvas.width = nextCanvas.width;
+        canvas.height = nextCanvas.height;
+        canvas.style.width = nextCanvas.style.width;
+        canvas.style.height = nextCanvas.style.height;
+        renderContext.setTransform(1, 0, 0, 1, 0, 0);
+        renderContext.drawImage(nextCanvas, 0, 0);
+        setPageSize({ width: cssWidth, height: cssHeight });
+        onPageSize(pageNumber, { width: cssWidth, height: cssHeight });
         canvas.dataset.renderEngine = "pdfium";
         setRenderEngine("pdfium");
         logRenderEngine(pageNumber, "pdfium");
 
-        const cached = document.createElement("canvas");
-        const cacheContext = cached.getContext("2d");
-        if (cacheContext) {
-          cached.width = canvas.width;
-          cached.height = canvas.height;
-          cached.style.width = canvas.style.width;
-          cached.style.height = canvas.style.height;
-          cached.dataset.renderEngine = "pdfium";
-          cacheContext.drawImage(canvas, 0, 0);
-          pageCanvasCache.set(key, cached);
-        }
+        nextCanvas.dataset.renderEngine = "pdfium";
+        pageCanvasCache.set(key, nextCanvas);
 
         if (isTextPageModel(result.textModel)) {
           const rawModel = {
@@ -2958,6 +2931,13 @@ function PdfPageView({
       }
 
       function renderWithPdfJs() {
+        canvas.width = Math.floor(viewport.width * pixelRatio);
+        canvas.height = Math.floor(viewport.height * pixelRatio);
+        canvas.style.width = `${viewport.width}px`;
+        canvas.style.height = `${viewport.height}px`;
+        renderContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+        setPageSize({ width: viewport.width, height: viewport.height });
+        onPageSize(pageNumber, { width: viewport.width, height: viewport.height });
         canvas.dataset.renderEngine = usePdfiumRender ? "pdfjs-fallback" : "pdfjs";
         setRenderEngine(usePdfiumRender ? "pdfjs-fallback" : "pdfjs");
         logRenderEngine(pageNumber, usePdfiumRender ? "pdfjs-fallback" : "pdfjs");
@@ -3074,7 +3054,7 @@ function PdfPageView({
       renderTask?.cancel();
       textLayer?.cancel();
     };
-  }, [pageCanvasCache, pdf, pdfData, pageNumber, reading.flowMode, reading.rotation, reading.scale]);
+  }, [canvasPixelRatio, pageCanvasCache, pdf, pdfData, pageNumber, reading.flowMode, reading.rotation, reading.scale]);
 
   useEffect(() => () => {
     if (textSelectionFrameRef.current !== null) cancelAnimationFrame(textSelectionFrameRef.current);
@@ -3098,7 +3078,7 @@ function PdfPageView({
   });
 
   const selectTextWithPdfium = async (start: { x: number; y: number }, end: { x: number; y: number }) => {
-    if (!pdfData || !window.pdfReadingText?.selectText || textModel?.source !== "pdfium") return null;
+    if (!pdfData || !window.pdfReadingText?.selectText) return null;
     const result = await window.pdfReadingText.selectText({
       data: pdfData,
       page: pageNumber,
@@ -3194,8 +3174,10 @@ function PdfPageView({
             cancelAnimationFrame(textSelectionFrameRef.current);
             textSelectionFrameRef.current = null;
           }
-          const nativeSelection = dragStartPoint ? await selectTextWithPdfium(dragStartPoint, point).catch(() => null) : null;
-          const selection = nativeSelection ?? (end === null ? null : buildCustomTextSelection(textModel, dragStart, end, pageSize));
+          const customSelection = end === null ? null : buildCustomTextSelection(textModel, dragStart, end, pageSize);
+          const nativeSelection =
+            customSelection === null && dragStartPoint ? await selectTextWithPdfium(dragStartPoint, point).catch(() => null) : null;
+          const selection = customSelection ?? nativeSelection;
           setTextSelectionDraft(null);
           if (!selection) {
             onClearTextSelection();
@@ -3456,6 +3438,104 @@ function TextSelectionToolbar({
   );
 }
 
+function SettingsDialog({
+  settings,
+  onClose,
+  onSettingsChange
+}: {
+  settings: AssistantSettings;
+  onClose: () => void;
+  onSettingsChange: (settings: AssistantSettings) => void;
+}) {
+  const theme: AppTheme = "default";
+  const language: AppLanguage = "zh";
+
+  const updateApiKey = (provider: CloudProvider, value: string) => {
+    onSettingsChange({
+      ...settings,
+      apiKeys: {
+        ...settings.apiKeys,
+        [provider]: value
+      }
+    });
+  };
+
+  return (
+    <div className="settings-backdrop" onMouseDown={onClose}>
+      <section className="settings-dialog" role="dialog" aria-modal="true" aria-label="设置" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="settings-dialog-header">
+          <div>
+            <h2>设置</h2>
+            <p>本机偏好与模型配置</p>
+          </div>
+          <button title="关闭设置" onClick={onClose}>
+            <X size={17} />
+          </button>
+        </header>
+
+        <div className="settings-section">
+          <div className="settings-section-title">
+            <h3>主题</h3>
+            <span>当前仅支持默认主题</span>
+          </div>
+          <label className="settings-field">
+            <span>主题</span>
+            <select value={theme} disabled>
+              <option value="default">默认</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="settings-section">
+          <div className="settings-section-title">
+            <h3>语言</h3>
+            <span>当前仅支持中文界面</span>
+          </div>
+          <label className="settings-field">
+            <span>界面语言</span>
+            <select value={language} disabled>
+              <option value="zh">中文</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="settings-section">
+          <div className="settings-section-title">
+            <h3>API</h3>
+            <span>用于云端翻译和提问</span>
+          </div>
+          <div className="api-key-list">
+            {Object.entries(cloudProviderPresets).map(([provider, preset]) => {
+              const typedProvider = provider as CloudProvider;
+              const value = settings.apiKeys[typedProvider] ?? "";
+              const isSet = Boolean(value.trim());
+              return (
+                <div className="api-key-row" key={provider}>
+                  <div className="api-key-heading">
+                    <strong>{preset.label}</strong>
+                    <span className={isSet ? "set" : ""}>{isSet ? "已设置" : "未设置"}</span>
+                  </div>
+                  <div className="api-key-control">
+                    <input
+                      type="password"
+                      value={value}
+                      placeholder={`输入 ${preset.label} API key`}
+                      onChange={(event) => updateApiKey(typedProvider, event.target.value)}
+                    />
+                    <button disabled={!isSet} onClick={() => updateApiKey(typedProvider, "")}>
+                      清除
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function AiPanel({
   assistantDraft,
   settings,
@@ -3481,7 +3561,8 @@ function AiPanel({
   const setMode = (mode: AssistantDraft["mode"]) =>
     onChange({ ...assistantDraft, mode, status: "idle", result: "", error: "", provider: null });
   const runDisabled = assistantDraft.status === "loading" || (assistantDraft.mode === "ask" && !assistantDraft.question.trim());
-  const showCloudSettings = settings.providerMode !== "local";
+  const isAskMode = assistantDraft.mode === "ask";
+  const showCloudSettings = isAskMode || settings.providerMode !== "local";
   const selectedProvider = cloudProviderPresets[settings.cloudProvider];
 
   return (
@@ -3507,17 +3588,19 @@ function AiPanel({
         />
       )}
       <section className="ai-settings">
-        <label>
-          <span>模式</span>
-          <select
-            value={settings.providerMode}
-            onChange={(event) => onSettingsChange({ ...settings, providerMode: event.target.value as AssistantSettings["providerMode"] })}
-          >
-            <option value="auto">自动</option>
-            <option value="cloud">云端</option>
-            <option value="local">本地</option>
-          </select>
-        </label>
+        {!isAskMode && (
+          <label>
+            <span>模式</span>
+            <select
+              value={settings.providerMode}
+              onChange={(event) => onSettingsChange({ ...settings, providerMode: event.target.value as AssistantSettings["providerMode"] })}
+            >
+              <option value="auto">自动</option>
+              <option value="cloud">云端</option>
+              <option value="local">本地</option>
+            </select>
+          </label>
+        )}
         {showCloudSettings && (
           <label>
             <span>模型</span>
@@ -3550,8 +3633,8 @@ function AiPanel({
         ) : (
           <p>
             {assistantDraft.mode === "translate"
-              ? "自动模式会优先使用 " + selectedProvider.label + "；没有配置密钥时尝试本地翻译。"
-              : "提问需要已配置的 " + selectedProvider.label + " 云端模型。"}
+              ? "自动模式会优先使用 " + selectedProvider.label + "；模型不可用时尝试本地翻译。"
+              : "提问会使用 " + selectedProvider.label + "。"}
           </p>
         )}
       </div>

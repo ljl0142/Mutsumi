@@ -21,6 +21,12 @@ contextBridge.exposeInMainWorld("pdfReadingTranslator", {
   }
 });
 
+contextBridge.exposeInMainWorld("pdfReadingAssistant", {
+  run(request) {
+    return ipcRenderer.invoke("assistant:run", request);
+  }
+});
+
 contextBridge.exposeInMainWorld("pdfReadingText", {
   extractPage(request) {
     return ipcRenderer.invoke("pdfium-text:extract-page", request);

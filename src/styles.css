@@ -23,6 +23,7 @@ body,
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -66,6 +67,13 @@ button:disabled {
   align-items: center;
   min-width: 0;
   gap: 10px;
+}
+
+.brand-icon {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
 }
 
 .brand-open-button {
@@ -559,6 +567,8 @@ button:disabled {
   position: absolute;
   inset: 0;
   z-index: 0;
+  width: 100% !important;
+  height: 100% !important;
 }
 
 .annotation-layer {
@@ -1288,6 +1298,158 @@ textarea {
   font-family: inherit;
   font-size: 12px;
   line-height: 1.6;
+}
+
+.settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(27, 35, 31, 0.24);
+}
+
+.settings-dialog {
+  width: min(560px, 100%);
+  max-height: min(720px, calc(100vh - 48px));
+  overflow: auto;
+  border: 1px solid #bcc8b9;
+  border-radius: 8px;
+  background: #fbfcf8;
+  box-shadow: 0 22px 60px rgba(27, 35, 31, 0.22);
+}
+
+.settings-dialog-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid #d9e0d6;
+}
+
+.settings-dialog-header h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+}
+
+.settings-dialog-header p {
+  margin: 0;
+  color: #667269;
+  font-size: 12px;
+}
+
+.settings-dialog-header button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 7px;
+}
+
+.settings-section {
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px;
+  border-bottom: 1px solid #e2e7df;
+}
+
+.settings-section:last-child {
+  border-bottom: 0;
+}
+
+.settings-section-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-section-title h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.settings-section-title span,
+.api-key-heading span {
+  color: #728077;
+  font-size: 12px;
+}
+
+.settings-field {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.settings-field > span {
+  color: #53625a;
+  font-size: 13px;
+}
+
+.settings-field select,
+.api-key-control input {
+  min-height: 34px;
+  border: 1px solid #c8d2c4;
+  border-radius: 7px;
+  padding: 0 10px;
+  background: #ffffff;
+  color: #22302a;
+}
+
+.settings-field select:disabled {
+  color: #53625a;
+  background: #eef3eb;
+}
+
+.api-key-list {
+  display: grid;
+  gap: 10px;
+}
+
+.api-key-row {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #d5ded2;
+  border-radius: 8px;
+  padding: 12px;
+  background: #ffffff;
+}
+
+.api-key-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.api-key-heading strong {
+  font-size: 13px;
+}
+
+.api-key-heading span.set {
+  color: #27604f;
+  font-weight: 700;
+}
+
+.api-key-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.api-key-control input {
+  width: 100%;
+  font-size: 12px;
+}
+
+.api-key-control button {
+  min-width: 58px;
+  border-radius: 7px;
+  padding: 0 12px;
+  font-size: 12px;
 }
 
 .sheet-tabs button.active {

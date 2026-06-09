@@ -54,11 +54,19 @@ function pdfiumEnv() {
 
 function pythonCandidates() {
   if (process.env.PDF_READING_PYTHON) return [[process.env.PDF_READING_PYTHON, []]];
+  const roots = Array.from(new Set([
+    projectRoot(),
+    path.resolve(path.dirname(process.execPath), "..", "..")
+  ]));
+  const localCandidates = roots.flatMap((root) => [
+    [path.join(root, ".venv-pdfium", "Scripts", "python.exe"), []],
+    [path.join(root, ".venv-pdfium", "bin", "python"), []],
+    [path.join(root, ".venv-argos", "Scripts", "python.exe"), []],
+    [path.join(root, ".venv-argos", "bin", "python"), []],
+  ]);
+
   return [
-    [path.join(projectRoot(), ".venv-pdfium", "Scripts", "python.exe"), []],
-    [path.join(projectRoot(), ".venv-pdfium", "bin", "python"), []],
-    [path.join(projectRoot(), ".venv-argos", "Scripts", "python.exe"), []],
-    [path.join(projectRoot(), ".venv-argos", "bin", "python"), []],
+    ...localCandidates,
     ["python", []],
     ["py", ["-3"]]
   ];

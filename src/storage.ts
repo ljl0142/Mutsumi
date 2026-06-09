@@ -14,6 +14,17 @@ type DesktopTranslatorBridge = {
   translate: (request: { text: string; sourceLanguage: string; targetLanguage: string }) => Promise<string>;
 };
 
+type DesktopAssistantBridge = {
+  run: (request: {
+    mode: "translate" | "ask";
+    provider: "gpt" | "gemini" | "deepseek" | "qwen";
+    text: string;
+    page: number;
+    question?: string;
+    targetLanguage: string;
+  }) => Promise<string>;
+};
+
 type DesktopTextBridge = {
   extractPage: (request: {
     data: ArrayBuffer;
@@ -63,6 +74,7 @@ declare global {
   interface Window {
     pdfReadingStorage?: DesktopStorageBridge;
     pdfReadingTranslator?: DesktopTranslatorBridge;
+    pdfReadingAssistant?: DesktopAssistantBridge;
     pdfReadingText?: DesktopTextBridge;
     pdfReadingRender?: DesktopRenderBridge;
     pdfReadingOcr?: DesktopOcrBridge;
@@ -74,7 +86,12 @@ declare global {
 export const defaultAssistantSettings: AssistantSettings = {
   providerMode: "auto",
   cloudProvider: "gpt",
-  apiKey: "",
+  apiKeys: {
+    gpt: "",
+    gemini: "",
+    deepseek: "",
+    qwen: ""
+  },
   sourceLanguage: "en",
   targetLanguage: "zh"
 };
@@ -98,6 +115,21 @@ function parseJson<T>(value: string | null): T | null {
   } catch {
     return null;
   }
+}
+
+type LegacyAssistantSettings = Partial<AssistantSettings> & { apiKey?: string };
+
+function normalizeAssistantSettings(saved?: LegacyAssistantSettings | null): AssistantSettings {
+  const legacyApiKey = saved?.apiKey?.trim();
+  return {
+    ...defaultAssistantSettings,
+    ...saved,
+    apiKeys: {
+      ...defaultAssistantSettings.apiKeys,
+      ...(saved?.apiKeys ?? {}),
+      ...(legacyApiKey ? { gpt: legacyApiKey } : {})
+    }
+  };
 }
 
 export const storage = {
@@ -130,10 +162,10 @@ export const storage = {
 
   loadAssistantSettings(): AssistantSettings {
     const desktopSettings = window.pdfReadingStorage?.loadAssistantSettings();
-    if (desktopSettings) return { ...defaultAssistantSettings, ...desktopSettings };
+    if (desktopSettings) return normalizeAssistantSettings(desktopSettings);
 
-    const saved = parseJson<Partial<AssistantSettings>>(window.localStorage.getItem(assistantSettingsKey()));
-    return { ...defaultAssistantSettings, ...saved };
+    const saved = parseJson<LegacyAssistantSettings>(window.localStorage.getItem(assistantSettingsKey()));
+    return normalizeAssistantSettings(saved);
   },
 
   saveAssistantSettings(settings: AssistantSettings) {

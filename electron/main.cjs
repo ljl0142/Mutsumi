@@ -2,6 +2,7 @@
 const path = require("node:path");
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
 const { extractPageTextWithPdfium, renderPageWithPdfium, selectTextWithPdfium } = require("./pdfiumText.cjs");
+const { runCloudAssistant } = require("./cloudAssistant.cjs");
 
 const isDev = process.env.NODE_ENV === "development" || process.env.ELECTRON_START_URL;
 const devUrl = process.env.ELECTRON_START_URL || "http://127.0.0.1:5173";
@@ -281,6 +282,8 @@ ipcMain.on("storage:save-assistant-settings", (event, settings) => {
 });
 
 ipcMain.handle("translator:translate", (_event, request) => translateLocally(request));
+
+ipcMain.handle("assistant:run", (_event, request) => runCloudAssistant(request, readJson(settingsPath())));
 
 ipcMain.handle("pdfium-text:extract-page", async (_event, request) => {
   try {
