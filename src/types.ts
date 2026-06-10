@@ -32,6 +32,7 @@ export type PaperAnnotation = {
   paperKey: string;
   page: number;
   rect: AnnotationRect;
+  rects?: AnnotationRect[];
   color: string;
   style: AnnotationStyle;
   hasNote: boolean;

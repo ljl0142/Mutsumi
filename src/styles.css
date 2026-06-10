@@ -574,7 +574,7 @@ button:disabled {
 .annotation-layer {
   position: absolute;
   inset: 0;
-  z-index: 1;
+  z-index: 4;
   pointer-events: none;
 }
 
@@ -668,7 +668,7 @@ button:disabled {
 .annotation-action-popover,
 .annotation-draft {
   position: absolute;
-  z-index: 4;
+  z-index: 5;
   border: 0;
   padding: 0;
   pointer-events: auto;
@@ -682,12 +682,48 @@ button:disabled {
   background: transparent;
 }
 
+.annotation-segments {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.annotation-segment {
+  position: absolute;
+  pointer-events: none;
+}
+
 .annotation-mark.highlight {
   background: color-mix(in srgb, var(--mark-color) 44%, transparent);
   mix-blend-mode: multiply;
 }
 
+.annotation-mark.multi.highlight {
+  background: transparent;
+}
+
+.annotation-segments.highlight {
+  opacity: 0.44;
+  mix-blend-mode: multiply;
+}
+
+.annotation-segment.highlight {
+  background: var(--mark-color);
+}
+
 .annotation-mark.underline {
+  border-bottom: 4px solid var(--mark-color);
+}
+
+.annotation-mark.multi.underline {
+  border-bottom: 0;
+}
+
+.annotation-segments.underline {
+  mix-blend-mode: multiply;
+}
+
+.annotation-segment.underline {
   border-bottom: 4px solid var(--mark-color);
 }
 
@@ -731,6 +767,7 @@ button:disabled {
 
 .annotation-action-popover {
   display: flex;
+  flex-direction: column;
   gap: 6px;
   width: max-content;
   padding: 6px;
@@ -738,6 +775,11 @@ button:disabled {
   border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 10px 26px rgba(36, 47, 43, 0.22);
+}
+
+.annotation-action-row {
+  display: flex;
+  gap: 6px;
 }
 
 .annotation-action-popover button {
@@ -750,13 +792,55 @@ button:disabled {
   font-size: 12px;
 }
 
+.annotation-action-popover .annotation-color-toggle {
+  justify-content: center;
+  width: 100%;
+}
+
+.annotation-color-row {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  padding: 2px 2px 1px;
+}
+
+.annotation-action-popover .annotation-color-swatch {
+  width: 22px;
+  min-height: 22px;
+  border-radius: 999px;
+  padding: 0;
+  border: 1px solid #c8d2c5;
+  background: var(--swatch-color);
+}
+
+.annotation-action-popover .annotation-color-swatch.active {
+  border-color: #27594c;
+  box-shadow: 0 0 0 2px rgba(39, 89, 76, 0.18);
+}
+
 .annotation-action-popover .danger {
   color: #8c3232;
 }
 
 .annotation-draft {
-  border: 1px dashed #27594c;
-  background: rgba(39, 89, 76, 0.12);
+  background: transparent;
+  opacity: 1;
+}
+
+.annotation-draft.highlight {
+  background: color-mix(in srgb, var(--mark-color) 34%, transparent);
+  outline: 1px dashed color-mix(in srgb, var(--mark-color) 72%, #27594c);
+  mix-blend-mode: multiply;
+}
+
+.annotation-draft.underline {
+  border-bottom: 4px solid var(--mark-color);
+  outline: 1px dashed color-mix(in srgb, var(--mark-color) 72%, #27594c);
+}
+
+.annotation-draft.box {
+  border: 2px dashed var(--mark-color);
+  background: color-mix(in srgb, var(--mark-color) 12%, transparent);
 }
 
 .empty-stage {

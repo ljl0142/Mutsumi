@@ -14,6 +14,7 @@ import {
   MessageSquarePlus,
   MousePointer2,
   NotebookPen,
+  Palette,
   PanelLeftClose,
   PanelRightClose,
   RotateCw,
@@ -71,6 +72,11 @@ type TextSelectionState = {
   text: string;
   page: number;
   position: { left: number; top: number };
+  rects?: AnnotationRect[];
+};
+
+type AnnotationGeometry = {
+  rect: AnnotationRect;
   rects?: AnnotationRect[];
 };
 
@@ -1122,6 +1128,65 @@ function buildCustomTextSelection(
   };
 }
 
+function boundingAnnotationRect(rects: AnnotationRect[]): AnnotationRect {
+  const left = Math.min(...rects.map((rect) => rect.x));
+  const top = Math.min(...rects.map((rect) => rect.y));
+  const right = Math.max(...rects.map((rect) => rect.x + rect.width));
+  const bottom = Math.max(...rects.map((rect) => rect.y + rect.height));
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top
+  };
+}
+
+function expandAnnotationRects(rects: AnnotationRect[]): AnnotationRect[] {
+  if (rects.length === 0) return rects;
+
+  const indexedRects = rects.map((rect, index) => ({ rect, index }));
+  const sortedRects = [...indexedRects].sort((left, right) => {
+    const leftCenter = left.rect.y + left.rect.height / 2;
+    const rightCenter = right.rect.y + right.rect.height / 2;
+    return leftCenter - rightCenter || left.rect.x - right.rect.x;
+  });
+  const medianHeight = median(sortedRects.map(({ rect }) => rect.height).filter((height) => height > 0));
+  const joinGap = medianHeight * 0.78;
+  const expanded = new Array<AnnotationRect>(rects.length);
+
+  sortedRects.forEach(({ rect, index }, sortedIndex) => {
+    const verticalExtra = rect.height * 0.56;
+    const horizontalExtra = Math.min(0.004, rect.width * 0.02);
+    const x = Math.max(0, rect.x - horizontalExtra / 2);
+    let y = Math.max(0, rect.y - verticalExtra / 2);
+    const right = Math.min(1, rect.x + rect.width + horizontalExtra / 2);
+
+    let bottom = Math.min(1, rect.y + rect.height + verticalExtra / 2);
+    const previous = sortedRects[sortedIndex - 1]?.rect;
+    const next = sortedRects[sortedIndex + 1]?.rect;
+
+    if (previous) {
+      const previousBottom = previous.y + previous.height;
+      const gap = rect.y - previousBottom;
+      if (gap > 0 && gap <= joinGap) y = Math.max(0, previousBottom + gap / 2);
+    }
+    if (next) {
+      const currentBottom = rect.y + rect.height;
+      const gap = next.y - currentBottom;
+      if (gap > 0 && gap <= joinGap) bottom = Math.min(1, currentBottom + gap / 2);
+    }
+
+    expanded[index] = {
+      x,
+      y,
+      width: right - x,
+      height: bottom - y
+    };
+  });
+
+  return expanded;
+}
+
 function buildPdfiumNativeSelection(result: PdfiumTextSelectionResult, pageSize: { width: number; height: number }) {
   if (result.empty || !result.text?.trim() || !result.rects?.length) return null;
   const rawRects = result.rects.map((rect) => ({
@@ -1755,17 +1820,20 @@ export function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [pageStep, reading.currentPage]);
 
-  const addAnnotation = (page: number, rect: AnnotationRect) => {
+  const addAnnotation = (page: number, geometry: AnnotationRect | AnnotationGeometry, style: AnnotationStyle = tool.style) => {
     if (!paperKey) return;
 
+    const rect = "rect" in geometry ? geometry.rect : geometry;
+    const rects = "rect" in geometry ? geometry.rects : undefined;
     const now = new Date().toISOString();
     const annotation: PaperAnnotation = {
       id: crypto.randomUUID(),
       paperKey,
       page,
       rect,
+      rects,
       color: tool.color,
-      style: tool.style,
+      style,
       hasNote: false,
       note: "",
       createdAt: now,
@@ -1810,6 +1878,14 @@ export function App() {
       )
     );
     setActiveAnnotationId((activeId) => (activeId === id ? null : activeId));
+  };
+
+  const updateAnnotationColor = (id: string, color: string) => {
+    setAnnotations((items) =>
+      items.map((annotation) =>
+        annotation.id === id ? { ...annotation, color, updatedAt: new Date().toISOString() } : annotation
+      )
+    );
   };
 
   const removeAnnotation = (id: string) => {
@@ -2191,6 +2267,7 @@ export function App() {
             onOpenFile={() => fileInputRef.current?.click()}
             onCreateAnnotation={addAnnotation}
             onCreateNote={createNoteForAnnotation}
+            onChangeAnnotationColor={updateAnnotationColor}
             onDeleteAnnotation={removeAnnotation}
             onSelectAnnotation={selectAnnotation}
             onSetCurrentPage={(page) => setReading((state) => ({ ...state, currentPage: normalizeDisplayPage(page, state) }))}
@@ -2239,6 +2316,15 @@ export function App() {
                 setAssistantDraft(createAssistantDraft("ask", textSelection.text, textSelection.page));
                 setLeftOpen(true);
                 setLeftPanelView("ai");
+                setTextSelection(null);
+              }}
+              onHighlight={() => {
+                if (!textSelection.rects?.length) return;
+                const rects = expandAnnotationRects(textSelection.rects);
+                addAnnotation(textSelection.page, {
+                  rect: boundingAnnotationRect(rects),
+                  rects
+                }, "highlight");
                 setTextSelection(null);
               }}
             />
@@ -2416,6 +2502,7 @@ function PdfStage({
   onOpenFile,
   onCreateAnnotation,
   onCreateNote,
+  onChangeAnnotationColor,
   onDeleteAnnotation,
   onSelectAnnotation,
   onSetCurrentPage,
@@ -2442,8 +2529,9 @@ function PdfStage({
   pendingAnnotationId: string | null;
   textSelection: TextSelectionState | null;
   onOpenFile: () => void;
-  onCreateAnnotation: (page: number, rect: AnnotationRect) => void;
+  onCreateAnnotation: (page: number, geometry: AnnotationRect | AnnotationGeometry) => void;
   onCreateNote: (id: string) => void;
+  onChangeAnnotationColor: (id: string, color: string) => void;
   onDeleteAnnotation: (id: string) => void;
   onSelectAnnotation: (id: string) => void;
   onSetCurrentPage: (page: number) => void;
@@ -2636,6 +2724,7 @@ function PdfStage({
               textSelection={textSelection?.page === pageNumber ? textSelection : null}
               onCreateAnnotation={onCreateAnnotation}
               onCreateNote={onCreateNote}
+              onChangeAnnotationColor={onChangeAnnotationColor}
               onDeleteAnnotation={onDeleteAnnotation}
               onPageSize={onPageSize}
               onTextModel={onTextModel}
@@ -2727,6 +2816,7 @@ function PdfPageView({
   textSelection,
   onCreateAnnotation,
   onCreateNote,
+  onChangeAnnotationColor,
   onDeleteAnnotation,
   onPageSize,
   onTextModel,
@@ -2748,8 +2838,9 @@ function PdfPageView({
   activeAnnotationId: string | null;
   pendingAnnotationId: string | null;
   textSelection: TextSelectionState | null;
-  onCreateAnnotation: (page: number, rect: AnnotationRect) => void;
+  onCreateAnnotation: (page: number, geometry: AnnotationRect | AnnotationGeometry) => void;
   onCreateNote: (id: string) => void;
+  onChangeAnnotationColor: (id: string, color: string) => void;
   onDeleteAnnotation: (id: string) => void;
   onPageSize: (page: number, size: { width: number; height: number }) => void;
   onTextModel: (page: number, model: TextPageModel) => void;
@@ -2761,7 +2852,8 @@ function PdfPageView({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const textLayerRef = useRef<HTMLDivElement | null>(null);
   const [pageSize, setPageSize] = useState(initialPageSize ?? getFallbackPageSize(reading));
-  const [draftRect, setDraftRect] = useState<AnnotationRect | null>(null);
+  const [draftGeometry, setDraftGeometry] = useState<AnnotationGeometry | null>(null);
+  const [colorPanelOpen, setColorPanelOpen] = useState(false);
   const [textModel, setTextModel] = useState<TextPageModel | null>(null);
   const [renderEngine, setRenderEngine] = useState<"pdfium" | "pdfjs" | "pdfjs-fallback" | "pending">("pending");
   const [textSelectionDraft, setTextSelectionDraft] = useState<{ start: number; end: number } | null>(null);
@@ -2769,11 +2861,16 @@ function PdfPageView({
   const textDragStartRef = useRef<number | null>(null);
   const textDragEndRef = useRef<number | null>(null);
   const textDragStartPointRef = useRef<{ x: number; y: number } | null>(null);
+  const textDragHasMovedRef = useRef(false);
   const textSelectionFrameRef = useRef<number | null>(null);
   const pendingTextSelectionDraftRef = useRef<{ start: number; end: number } | null>(null);
   const scaleRef = useRef(reading.scale);
   const rotationRef = useRef(reading.rotation);
   const usePdfiumRender = Boolean(pdfData && isPdfiumRenderEnabled());
+
+  useEffect(() => {
+    setColorPanelOpen(false);
+  }, [activeAnnotationId]);
 
   const updateTextSelectionDraft = useCallback((draft: { start: number; end: number }) => {
     pendingTextSelectionDraftRef.current = draft;
@@ -3100,23 +3197,31 @@ function PdfPageView({
       onPointerDown={(event) => {
         if (!pageSize.width || event.button !== 0) return;
         onClearSelection();
-        if (tool.mode === "select") return;
+        if (tool.mode === "select") {
+          if (textSelection) onClearTextSelection();
+          return;
+        }
         event.currentTarget.setPointerCapture(event.pointerId);
-        dragStartRef.current = getPoint(event);
-        setDraftRect({ x: dragStartRef.current.x / pageSize.width, y: dragStartRef.current.y / pageSize.height, width: 0, height: 0 });
+        const point = getPoint(event);
+        dragStartRef.current = point;
+        setDraftGeometry({ rect: normalizeRect(point, point) });
       }}
       onPointerMove={(event) => {
         if (tool.mode === "select") return;
         if (!dragStartRef.current) return;
-        setDraftRect(normalizeRect(dragStartRef.current, getPoint(event)));
+        setDraftGeometry({ rect: normalizeRect(dragStartRef.current, getPoint(event)) });
       }}
       onPointerUp={(event) => {
         if (tool.mode === "select") return;
         if (!dragStartRef.current) return;
-        const rect = normalizeRect(dragStartRef.current, getPoint(event));
+        const startPoint = dragStartRef.current;
+        const endPoint = getPoint(event);
+        const rect = normalizeRect(startPoint, endPoint);
         dragStartRef.current = null;
-        setDraftRect(null);
-        if (rect.width > 0.01 && rect.height > 0.006) onCreateAnnotation(pageNumber, rect);
+        setDraftGeometry(null);
+        if (rect.width > 0.01 && rect.height > 0.006) {
+          onCreateAnnotation(pageNumber, rect);
+        }
       }}
     >
       <canvas ref={canvasRef} />
@@ -3127,6 +3232,11 @@ function PdfPageView({
           if (tool.mode !== "select") return;
           event.preventDefault();
           event.stopPropagation();
+          onClearSelection();
+          if (textSelection) {
+            onClearTextSelection();
+            return;
+          }
           const point = getPoint(event);
           const start = hitTestTextChar(textModel, point, "start");
           if (start === null) {
@@ -3137,6 +3247,7 @@ function PdfPageView({
           textDragStartRef.current = start;
           textDragEndRef.current = start;
           textDragStartPointRef.current = point;
+          textDragHasMovedRef.current = false;
           pendingTextSelectionDraftRef.current = null;
           setTextSelectionDraft(null);
           onClearTextSelection();
@@ -3145,6 +3256,12 @@ function PdfPageView({
           if (tool.mode !== "select" || textDragStartRef.current === null) return;
           event.preventDefault();
           const point = getPoint(event);
+          const startPoint = textDragStartPointRef.current;
+          if (startPoint && !textDragHasMovedRef.current) {
+            const dragDistance = Math.hypot(point.x - startPoint.x, point.y - startPoint.y);
+            if (dragDistance < 4) return;
+            textDragHasMovedRef.current = true;
+          }
           const normalEnd = hitTestTextChar(textModel, point);
           const affinity = normalEnd !== null && normalEnd < textDragStartRef.current ? "backwardEnd" : "forwardEnd";
           const end = hitTestTextChar(textModel, point, affinity);
@@ -3166,13 +3283,20 @@ function PdfPageView({
           const normalEnd = hitTestTextChar(textModel, point);
           const affinity = normalEnd !== null && normalEnd < textDragStartRef.current ? "backwardEnd" : "forwardEnd";
           const end = hitTestTextChar(textModel, point, affinity) ?? textDragEndRef.current;
+          const didDrag = textDragHasMovedRef.current;
           textDragStartRef.current = null;
           textDragEndRef.current = null;
           textDragStartPointRef.current = null;
+          textDragHasMovedRef.current = false;
           pendingTextSelectionDraftRef.current = null;
           if (textSelectionFrameRef.current !== null) {
             cancelAnimationFrame(textSelectionFrameRef.current);
             textSelectionFrameRef.current = null;
+          }
+          if (!didDrag) {
+            setTextSelectionDraft(null);
+            onClearTextSelection();
+            return;
           }
           const customSelection = end === null ? null : buildCustomTextSelection(textModel, dragStart, end, pageSize);
           const nativeSelection =
@@ -3218,7 +3342,7 @@ function PdfPageView({
           const noteIndex = noteOrder.findIndex((item) => item.id === annotation.id) + 1;
           return (
             <button
-              className={`annotation-mark ${annotation.style} ${activeAnnotationId === annotation.id ? "active" : ""}`}
+              className={`annotation-mark ${annotation.style} ${annotationRects(annotation).length > 1 ? "multi" : ""} ${activeAnnotationId === annotation.id ? "active" : ""}`}
               key={annotation.id}
               style={markStyle(annotation, pageSize)}
               onPointerDown={(event) => event.stopPropagation()}
@@ -3228,6 +3352,17 @@ function PdfPageView({
               }}
               title={annotation.hasNote ? `对应右侧第 ${noteIndex} 条注释` : "未添加注释的标注"}
             >
+              {annotationRects(annotation).length > 1 && (
+                <div className={`annotation-segments ${annotation.style}`}>
+                  {annotationRects(annotation).map((rect, index) => (
+                    <div
+                      className={`annotation-segment ${annotation.style}`}
+                      key={index}
+                      style={segmentStyle(annotation, rect, pageSize)}
+                    />
+                  ))}
+                </div>
+              )}
               {annotation.hasNote && <span style={noteBadgeStyle(pageSize)}>{noteIndex}</span>}
             </button>
           );
@@ -3253,17 +3388,44 @@ function PdfPageView({
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => event.stopPropagation()}
           >
-            <button title="添加或打开注释" onClick={() => onCreateNote(activeAnnotationId)}>
-              <MessageSquarePlus size={15} />
-              注释
+            <div className="annotation-action-row">
+              <button title="添加或打开注释" onClick={() => onCreateNote(activeAnnotationId)}>
+                <MessageSquarePlus size={15} />
+                注释
+              </button>
+              <button className="danger" title="删除标注" onClick={() => onDeleteAnnotation(activeAnnotationId)}>
+                <Trash2 size={15} />
+                删除
+              </button>
+            </div>
+            <button className="annotation-color-toggle" title="更改颜色" onClick={() => setColorPanelOpen((value) => !value)}>
+              <Palette size={15} />
+              更改颜色
             </button>
-            <button className="danger" title="删除标注" onClick={() => onDeleteAnnotation(activeAnnotationId)}>
-              <Trash2 size={15} />
-              删除
-            </button>
+            {colorPanelOpen && (
+              <div className="annotation-color-row" aria-label="更改标注颜色">
+                {toolColors.map((color) => {
+                  const currentColor = annotations.find((annotation) => annotation.id === activeAnnotationId)?.color;
+                  return (
+                    <button
+                      className={`annotation-color-swatch ${currentColor === color ? "active" : ""}`}
+                      key={color}
+                      style={{ "--swatch-color": color } as CSSProperties}
+                      title="更改颜色"
+                      onClick={() => {
+                        onChangeAnnotationColor(activeAnnotationId, color);
+                        setColorPanelOpen(false);
+                      }}
+                    />
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
-        {draftRect && <div className="annotation-draft" style={rectToStyle(draftRect, pageSize)} />}
+        {draftGeometry && (
+          <div className={`annotation-draft ${tool.style}`} style={markStyle({ ...draftGeometry, id: "draft", paperKey: "", page: pageNumber, color: tool.color, style: tool.style, hasNote: false, note: "", createdAt: "", updatedAt: "" }, pageSize)} />
+        )}
       </div>
     </div>
   );
@@ -3411,12 +3573,14 @@ function TextSelectionToolbar({
   selection,
   onCopy,
   onTranslate,
-  onAsk
+  onAsk,
+  onHighlight
 }: {
   selection: TextSelectionState;
   onCopy: () => void;
   onTranslate: () => void;
   onAsk: () => void;
+  onHighlight: () => void;
 }) {
   return (
     <div className="selection-toolbar" style={{ left: selection.position.left, top: selection.position.top }}>
@@ -3432,6 +3596,10 @@ function TextSelectionToolbar({
         <button title="提问" onClick={onAsk}>
           <Bot size={14} />
           提问
+        </button>
+        <button title="高亮" onClick={onHighlight}>
+          <Highlighter size={14} />
+          高亮
         </button>
       </div>
     </div>
@@ -3841,7 +4009,7 @@ function renderInlineMath(line: string) {
 function bubbleStyle(annotation: PaperAnnotation | undefined, pageSize: { width: number; height: number }) {
   if (!annotation) return { display: "none" };
 
-  const rect = rectToStyle(annotation.rect, pageSize);
+  const rect = rectToStyle(annotationAnchorRect(annotation, "end"), pageSize);
   return {
     left: Math.min(Number(rect.left) + Number(rect.width) + 6, pageSize.width - 34),
     top: Math.min(Number(rect.top) + Number(rect.height) + 6, pageSize.height - 34)
@@ -3851,7 +4019,7 @@ function bubbleStyle(annotation: PaperAnnotation | undefined, pageSize: { width:
 function popoverStyle(annotation: PaperAnnotation | undefined, pageSize: { width: number; height: number }) {
   if (!annotation) return { display: "none" };
 
-  const rect = rectToStyle(annotation.rect, pageSize);
+  const rect = rectToStyle(annotationAnchorRect(annotation, "start"), pageSize);
   return {
     left: Math.min(Number(rect.left) + Number(rect.width) + 8, pageSize.width - 150),
     top: Math.max(Number(rect.top) - 8, 8)
@@ -3880,6 +4048,15 @@ function rectToStyle(rect: AnnotationRect, pageSize: { width: number; height: nu
   };
 }
 
+function annotationRects(annotation: PaperAnnotation) {
+  return annotation.rects?.length ? annotation.rects : [annotation.rect];
+}
+
+function annotationAnchorRect(annotation: PaperAnnotation, edge: "start" | "end") {
+  const rects = annotationRects(annotation);
+  return edge === "end" ? rects[rects.length - 1] : rects[0];
+}
+
 function textSelectionRectToStyle(rect: AnnotationRect, pageSize: { width: number; height: number }) {
   const top = rect.y * pageSize.height;
   const height = rect.height * pageSize.height;
@@ -3898,6 +4075,18 @@ function textSelectionRectToStyle(rect: AnnotationRect, pageSize: { width: numbe
 function markStyle(annotation: PaperAnnotation, pageSize: { width: number; height: number }) {
   return {
     ...rectToStyle(annotation.rect, pageSize),
+    "--mark-color": annotation.color
+  } as CSSProperties;
+}
+
+function segmentStyle(annotation: PaperAnnotation, rect: AnnotationRect, pageSize: { width: number; height: number }) {
+  const bounds = rectToStyle(annotation.rect, pageSize);
+  const segment = rectToStyle(rect, pageSize);
+  return {
+    left: Number(segment.left) - Number(bounds.left),
+    top: Number(segment.top) - Number(bounds.top),
+    width: Number(segment.width),
+    height: Number(segment.height),
     "--mark-color": annotation.color
   } as CSSProperties;
 }
