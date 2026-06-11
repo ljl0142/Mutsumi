@@ -547,6 +547,7 @@ button:disabled {
 
 .page-layer {
   position: relative;
+  isolation: isolate;
   touch-action: none;
 }
 
@@ -571,11 +572,19 @@ button:disabled {
   height: 100% !important;
 }
 
+.annotation-visual-layer,
 .annotation-layer {
   position: absolute;
   inset: 0;
-  z-index: 4;
   pointer-events: none;
+}
+
+.annotation-visual-layer {
+  z-index: 1;
+}
+
+.annotation-layer {
+  z-index: 4;
 }
 
 .text-layer {
@@ -674,6 +683,13 @@ button:disabled {
   pointer-events: auto;
 }
 
+.annotation-visual {
+  position: absolute;
+  border: 0;
+  padding: 0;
+  pointer-events: none;
+}
+
 .annotation-draft {
   pointer-events: none;
 }
@@ -693,29 +709,33 @@ button:disabled {
   pointer-events: none;
 }
 
-.annotation-mark.highlight {
-  background: color-mix(in srgb, var(--mark-color) 44%, transparent);
-  mix-blend-mode: multiply;
+.annotation-visual.highlight {
+  background: color-mix(in srgb, var(--highlight-color) 82%, transparent);
+  mix-blend-mode: darken;
 }
 
-.annotation-mark.multi.highlight {
+.annotation-visual.multi.highlight {
   background: transparent;
 }
 
+.page-layer[data-render-engine="pdfium"][data-pdfium-annotations-ready="true"] .annotation-visual.highlight,
+.page-layer[data-render-engine="pdfium"][data-pdfium-annotations-ready="true"] .annotation-segments.highlight {
+  display: none;
+}
+
 .annotation-segments.highlight {
-  opacity: 0.44;
-  mix-blend-mode: multiply;
+  mix-blend-mode: darken;
 }
 
 .annotation-segment.highlight {
-  background: var(--mark-color);
+  background: color-mix(in srgb, var(--highlight-color) 82%, transparent);
 }
 
-.annotation-mark.underline {
+.annotation-visual.underline {
   border-bottom: 4px solid var(--mark-color);
 }
 
-.annotation-mark.multi.underline {
+.annotation-visual.multi.underline {
   border-bottom: 0;
 }
 
@@ -727,7 +747,7 @@ button:disabled {
   border-bottom: 4px solid var(--mark-color);
 }
 
-.annotation-mark.box {
+.annotation-visual.box {
   border: 2px solid var(--mark-color);
   background: color-mix(in srgb, var(--mark-color) 14%, transparent);
 }
@@ -828,9 +848,9 @@ button:disabled {
 }
 
 .annotation-draft.highlight {
-  background: color-mix(in srgb, var(--mark-color) 34%, transparent);
+  background: color-mix(in srgb, var(--mark-color) 48%, transparent);
   outline: 1px dashed color-mix(in srgb, var(--mark-color) 72%, #27594c);
-  mix-blend-mode: multiply;
+  mix-blend-mode: darken;
 }
 
 .annotation-draft.underline {

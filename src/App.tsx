@@ -1259,6 +1259,13 @@ function pageRenderCacheKey(pageNumber: number, scale: number, rotation: number,
   return `${pageNumber}:${scale}:${rotation}:${Math.round(pixelRatio * 100)}`;
 }
 
+function pageAnnotationRenderKey(annotations: PaperAnnotation[]) {
+  return annotations
+    .filter((annotation) => annotation.style === "highlight")
+    .map((annotation) => `${annotation.id}:${annotation.color}:${annotation.updatedAt}`)
+    .join("|");
+}
+
 function isPdfiumRenderEnabled() {
   return Boolean(window.pdfReadingRender);
 }
@@ -1296,27 +1303,77 @@ function drawPdfiumBitmap(
 ) {
   const bytes = base64ToBytes(bitmap.data);
   const imageData = context.createImageData(bitmap.width, bitmap.height);
-  const channels = bitmap.mode === "BGRA" || bitmap.mode === "RGBA" ? 4 : 3;
+  const channels = ["BGRA", "RGBA", "BGRx", "RGBx"].includes(bitmap.mode) ? 4 : 3;
 
   for (let y = 0; y < bitmap.height; y += 1) {
     for (let x = 0; x < bitmap.width; x += 1) {
       const source = y * bitmap.stride + x * channels;
       const target = (y * bitmap.width + x) * 4;
-      if (bitmap.mode === "RGBA") {
+      if (bitmap.mode === "RGBA" || bitmap.mode === "RGBx") {
         imageData.data[target] = bytes[source] ?? 255;
         imageData.data[target + 1] = bytes[source + 1] ?? 255;
         imageData.data[target + 2] = bytes[source + 2] ?? 255;
-        imageData.data[target + 3] = bytes[source + 3] ?? 255;
+        imageData.data[target + 3] = bitmap.mode === "RGBx" ? 255 : bytes[source + 3] ?? 255;
       } else {
         imageData.data[target] = bytes[source + 2] ?? 255;
         imageData.data[target + 1] = bytes[source + 1] ?? 255;
         imageData.data[target + 2] = bytes[source] ?? 255;
-        imageData.data[target + 3] = channels === 4 ? bytes[source + 3] ?? 255 : 255;
+        imageData.data[target + 3] = bitmap.mode === "BGRx" ? 255 : channels === 4 ? bytes[source + 3] ?? 255 : 255;
       }
     }
   }
 
   context.putImageData(imageData, 0, 0);
+}
+
+function applyCanvasHighlights(
+  context: CanvasRenderingContext2D,
+  cssSize: { width: number; height: number },
+  pixelRatio: number,
+  annotations: PaperAnnotation[]
+) {
+  const highlightAnnotations = annotations.filter((annotation) => annotation.style === "highlight");
+  if (!highlightAnnotations.length) return;
+
+  const canvas = context.canvas;
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+
+  highlightAnnotations.forEach((annotation) => {
+    const [red, green, blue] = hexToRgb(highlightDisplayColor(annotation.color));
+    const alpha = 0.62;
+    const redFactor = 1 - alpha + alpha * (red / 255);
+    const greenFactor = 1 - alpha + alpha * (green / 255);
+    const blueFactor = 1 - alpha + alpha * (blue / 255);
+
+    annotationRects(annotation).forEach((rect) => {
+      const left = Math.max(0, Math.floor(rect.x * cssSize.width * pixelRatio));
+      const top = Math.max(0, Math.floor(rect.y * cssSize.height * pixelRatio));
+      const right = Math.min(canvas.width, Math.ceil((rect.x + rect.width) * cssSize.width * pixelRatio));
+      const bottom = Math.min(canvas.height, Math.ceil((rect.y + rect.height) * cssSize.height * pixelRatio));
+
+      for (let y = top; y < bottom; y += 1) {
+        for (let x = left; x < right; x += 1) {
+          const index = (y * canvas.width + x) * 4;
+          data[index] = Math.round(data[index] * redFactor);
+          data[index + 1] = Math.round(data[index + 1] * greenFactor);
+          data[index + 2] = Math.round(data[index + 2] * blueFactor);
+        }
+      }
+    });
+  });
+
+  context.putImageData(imageData, 0, 0);
+}
+
+function hexToRgb(color: string) {
+  const normalized = color.startsWith("#") ? color.slice(1) : color;
+  if (normalized.length !== 6) return [255, 230, 111] as const;
+  const red = Number.parseInt(normalized.slice(0, 2), 16);
+  const green = Number.parseInt(normalized.slice(2, 4), 16);
+  const blue = Number.parseInt(normalized.slice(4, 6), 16);
+  if (![red, green, blue].every(Number.isFinite)) return [255, 230, 111] as const;
+  return [red, green, blue] as const;
 }
 
 function base64ToBytes(value: string) {
@@ -2170,7 +2227,7 @@ export function App() {
               key={color}
               title={`标注颜色 ${color}`}
               style={{ "--swatch": color } as CSSProperties}
-              onClick={() => setTool((current) => ({ ...current, color, mode: "annotate" }))}
+              onClick={() => setTool((current) => ({ ...current, color }))}
             />
           ))}
           <ToolButton icon={<Highlighter size={17} />} label="高亮" styleName="highlight" tool={tool} onSelect={(style) => setTool((current) => ({ ...current, style, mode: "annotate" }))} />
@@ -2856,6 +2913,7 @@ function PdfPageView({
   const [colorPanelOpen, setColorPanelOpen] = useState(false);
   const [textModel, setTextModel] = useState<TextPageModel | null>(null);
   const [renderEngine, setRenderEngine] = useState<"pdfium" | "pdfjs" | "pdfjs-fallback" | "pending">("pending");
+  const [renderedAnnotationKey, setRenderedAnnotationKey] = useState("");
   const [textSelectionDraft, setTextSelectionDraft] = useState<{ start: number; end: number } | null>(null);
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
   const textDragStartRef = useRef<number | null>(null);
@@ -2867,6 +2925,7 @@ function PdfPageView({
   const scaleRef = useRef(reading.scale);
   const rotationRef = useRef(reading.rotation);
   const usePdfiumRender = Boolean(pdfData && isPdfiumRenderEnabled());
+  const annotationRenderKey = pageAnnotationRenderKey(annotations);
 
   useEffect(() => {
     setColorPanelOpen(false);
@@ -2925,9 +2984,11 @@ function PdfPageView({
         context.clearRect(0, 0, canvas.width, canvas.height);
         context.drawImage(cachedCanvas, 0, 0);
         const cachedEngine = cachedCanvas.dataset.renderEngine as "pdfium" | "pdfjs" | "pdfjs-fallback" | undefined;
-        if (cachedEngine) {
+        if (cachedEngine && Number.isFinite(cachedWidth) && Number.isFinite(cachedHeight) && cachedWidth > 0) {
+          applyCanvasHighlights(context, { width: cachedWidth, height: cachedHeight }, canvas.width / cachedWidth, annotations);
           canvas.dataset.renderEngine = cachedEngine;
           setRenderEngine(cachedEngine);
+          setRenderedAnnotationKey(cachedEngine === "pdfium" ? annotationRenderKey : "");
         }
       }
     }
@@ -2984,10 +3045,12 @@ function PdfPageView({
         canvas.style.height = nextCanvas.style.height;
         renderContext.setTransform(1, 0, 0, 1, 0, 0);
         renderContext.drawImage(nextCanvas, 0, 0);
+        applyCanvasHighlights(renderContext, { width: cssWidth, height: cssHeight }, renderPixelRatio, annotations);
         setPageSize({ width: cssWidth, height: cssHeight });
         onPageSize(pageNumber, { width: cssWidth, height: cssHeight });
         canvas.dataset.renderEngine = "pdfium";
         setRenderEngine("pdfium");
+        setRenderedAnnotationKey(annotationRenderKey);
         logRenderEngine(pageNumber, "pdfium");
 
         nextCanvas.dataset.renderEngine = "pdfium";
@@ -3013,6 +3076,7 @@ function PdfPageView({
             if (handled || isCancelled) return;
             canvas.dataset.renderEngine = "pdfjs-fallback";
             setRenderEngine("pdfjs-fallback");
+            setRenderedAnnotationKey("");
             logRenderEngine(pageNumber, "pdfjs-fallback");
             renderWithPdfJs();
           })
@@ -3020,6 +3084,7 @@ function PdfPageView({
             if (!isCancelled) {
               canvas.dataset.renderEngine = "pdfjs-fallback";
               setRenderEngine("pdfjs-fallback");
+              setRenderedAnnotationKey("");
               logRenderEngine(pageNumber, "pdfjs-fallback");
               renderWithPdfJs();
             }
@@ -3037,6 +3102,7 @@ function PdfPageView({
         onPageSize(pageNumber, { width: viewport.width, height: viewport.height });
         canvas.dataset.renderEngine = usePdfiumRender ? "pdfjs-fallback" : "pdfjs";
         setRenderEngine(usePdfiumRender ? "pdfjs-fallback" : "pdfjs");
+        setRenderedAnnotationKey("");
         logRenderEngine(pageNumber, usePdfiumRender ? "pdfjs-fallback" : "pdfjs");
         renderTask = page.render({ canvasContext: renderContext, viewport });
         renderTask.promise
@@ -3151,7 +3217,7 @@ function PdfPageView({
       renderTask?.cancel();
       textLayer?.cancel();
     };
-  }, [canvasPixelRatio, pageCanvasCache, pdf, pdfData, pageNumber, reading.flowMode, reading.rotation, reading.scale]);
+  }, [annotationRenderKey, canvasPixelRatio, pageCanvasCache, pdf, pdfData, pageNumber, reading.flowMode, reading.rotation, reading.scale]);
 
   useEffect(() => () => {
     if (textSelectionFrameRef.current !== null) cancelAnimationFrame(textSelectionFrameRef.current);
@@ -3193,6 +3259,7 @@ function PdfPageView({
       className="page-layer"
       data-page-number={pageNumber}
       data-render-engine={renderEngine}
+      data-pdfium-annotations-ready={renderEngine === "pdfium" && renderedAnnotationKey === annotationRenderKey ? "true" : "false"}
       style={{ width: pageSize.width, height: pageSize.height, "--text-hit-slop": `${Math.min(0.02 + reading.scale * 0.018, 0.065)}em` } as CSSProperties}
       onPointerDown={(event) => {
         if (!pageSize.width || event.button !== 0) return;
@@ -3318,6 +3385,11 @@ function PdfPageView({
           });
         }}
       />
+      <div className="annotation-visual-layer">
+        {annotations.map((annotation) => (
+          <AnnotationVisual annotation={annotation} key={annotation.id} pageSize={pageSize} />
+        ))}
+      </div>
       {tool.mode === "select" && textSelectionDraft && (
         <div className="custom-text-selection-layer">
           {buildCustomTextSelection(
@@ -3352,17 +3424,6 @@ function PdfPageView({
               }}
               title={annotation.hasNote ? `对应右侧第 ${noteIndex} 条注释` : "未添加注释的标注"}
             >
-              {annotationRects(annotation).length > 1 && (
-                <div className={`annotation-segments ${annotation.style}`}>
-                  {annotationRects(annotation).map((rect, index) => (
-                    <div
-                      className={`annotation-segment ${annotation.style}`}
-                      key={index}
-                      style={segmentStyle(annotation, rect, pageSize)}
-                    />
-                  ))}
-                </div>
-              )}
               {annotation.hasNote && <span style={noteBadgeStyle(pageSize)}>{noteIndex}</span>}
             </button>
           );
@@ -3427,6 +3488,35 @@ function PdfPageView({
           <div className={`annotation-draft ${tool.style}`} style={markStyle({ ...draftGeometry, id: "draft", paperKey: "", page: pageNumber, color: tool.color, style: tool.style, hasNote: false, note: "", createdAt: "", updatedAt: "" }, pageSize)} />
         )}
       </div>
+    </div>
+  );
+}
+
+function AnnotationVisual({
+  annotation,
+  pageSize
+}: {
+  annotation: PaperAnnotation;
+  pageSize: { width: number; height: number };
+}) {
+  const rects = annotationRects(annotation);
+
+  return (
+    <div
+      className={`annotation-visual ${annotation.style} ${rects.length > 1 ? "multi" : ""}`}
+      style={markStyle(annotation, pageSize)}
+    >
+      {rects.length > 1 && (
+        <div className={`annotation-segments ${annotation.style}`}>
+          {rects.map((rect, index) => (
+            <div
+              className={`annotation-segment ${annotation.style}`}
+              key={index}
+              style={segmentStyle(annotation, rect, pageSize)}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -4072,10 +4162,22 @@ function textSelectionRectToStyle(rect: AnnotationRect, pageSize: { width: numbe
   };
 }
 
+function highlightDisplayColor(color: string) {
+  const colorMap: Record<string, string> = {
+    "#f8d85a": "#ffe66f",
+    "#9be7c0": "#b5f1d2",
+    "#8ec5ff": "#9fd1ff",
+    "#ffb1c8": "#ffc2d4",
+    "#c8b6ff": "#dacdff"
+  };
+  return colorMap[color] ?? color;
+}
+
 function markStyle(annotation: PaperAnnotation, pageSize: { width: number; height: number }) {
   return {
     ...rectToStyle(annotation.rect, pageSize),
-    "--mark-color": annotation.color
+    "--mark-color": annotation.color,
+    "--highlight-color": highlightDisplayColor(annotation.color)
   } as CSSProperties;
 }
 
@@ -4087,6 +4189,7 @@ function segmentStyle(annotation: PaperAnnotation, rect: AnnotationRect, pageSiz
     top: Number(segment.top) - Number(bounds.top),
     width: Number(segment.width),
     height: Number(segment.height),
-    "--mark-color": annotation.color
+    "--mark-color": annotation.color,
+    "--highlight-color": highlightDisplayColor(annotation.color)
   } as CSSProperties;
 }

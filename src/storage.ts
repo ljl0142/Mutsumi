@@ -48,6 +48,11 @@ type DesktopRenderBridge = {
     page: number;
     scale: number;
     rotation: number;
+    annotations?: Array<{
+      color: string;
+      style: string;
+      rects: Array<{ x: number; y: number; width: number; height: number }>;
+    }>;
   }) => Promise<unknown>;
 };
 

@@ -158,7 +158,8 @@ async function renderPageWithPdfium(request) {
     pdfPath,
     page: request.page,
     scale: request.scale,
-    rotation: request.rotation
+    rotation: request.rotation,
+    annotations: Array.isArray(request.annotations) ? request.annotations : []
   };
 
   let lastError = null;
